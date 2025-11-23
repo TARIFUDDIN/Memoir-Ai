@@ -145,4 +145,4 @@ Follow these steps to get MeetingBot running locally on your machine:
 
 6. **Open your browser**
 
-   Navigate to [http://localhost:3000](http://localhost:3000) to see your MeetingBot application running locally.
+   Navigate to [http://localhost:3000](http://localhost:3000) to see your MeetingBot application running locally."# Memoir-Ai" 
