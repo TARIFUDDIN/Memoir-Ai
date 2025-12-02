@@ -4,7 +4,7 @@ import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-    apiVersion: '2025-06-30.basil'
+    apiVersion: '2025-08-27.basil'
 })
 
 const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!
@@ -164,9 +164,9 @@ function getPlanFromSubscription(subscription: Stripe.Subscription) {
     const priceId = subscription.items.data[0]?.price.id
 
     const priceToPlank: Record<string, string> = {
-        'price_1RpqPqPM25qIcCJyMdRhoNah': 'starter',
-        'price_1RpqPqPM25qIcCJyWkSDTdKN': 'pro',
-        'price_1RpqPqPM25qIcCJyXD9K1yKM': 'premium'
+        'price_1SWjV6SWzzLnK0uGK51aS6xD': 'starter',
+        'price_1SWjVYSWzzLnK0uGd5Rs6GON': 'pro',
+        'price_1SWjVuSWzzLnK0uGFv10vELa': 'premium'
     }
 
     return priceToPlank[priceId] || 'invalid'

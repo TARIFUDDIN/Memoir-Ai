@@ -1,32 +1,5 @@
 ![MeetingBot - AI Meeting NoteTaker](https://meetingbot3.s3.us-east-1.amazonaws.com/FULL+STACK.png)
 
-[Link to 30 hours long YouTube Tutorial](https://www.youtube.com/watch?v=5meG9KB1w0g)
-PS: Youtube only allows videos of max duration of 12 hours. But since my video is 30 hours long, I uploaded it as 3 different parts. The link above is of the first part(2nd and 3rd parts of tutorial link in description of the above video)
-
-## Upcoming Features
-
-- [ ] Integrations
-   - [ ] Notion Integration
-   - [ ] Linear Integration
-   - [ ] Salesforce Integration
-   - [ ] Hubspot Integration
-- [ ] For past meetings:
-    - [ ] Users should be able to search through their meetings
-    - [ ] Date based filtering (ex: march 17 to april 1)
-    - [ ] Custom date ranges filtering (ex: last week, last month, last quarter)
-    - [ ] Meeting duration filtering (ex: less than 30 mins)
-    - [ ] Participant based filtering
-- [ ] 100+ languages transcript translation (similar to what fireflies.ai does) (Users will be able to view their transcripts in over 100 languages. They can go to a dropdown menu and change their transcript language) - use Google Cloud Translation API
-
-- [ ] Workspaces Creation
-    - [ ] Users can create a workspace
-    - [ ] Users can invite other people to their workspace
-    - [ ] Role based access
-
-
-## Contributing
-
-Any contributions are very much appreciated. Take a feature from the above list (or hmu if you got any other feature in your mind that you'd like to implement) and then make a PR 🤛
 
 # Overview
 

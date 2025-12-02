@@ -9,6 +9,17 @@ import ActionItems from './components/action-items/ActionItems'
 import TranscriptDisplay from './components/TranscriptDisplay'
 import ChatSidebar from './components/ChatSidebar'
 import CustomAudioPlayer from './components/AudioPlayer'
+import { AlertTriangle } from 'lucide-react'
+import { 
+    AreaChart, 
+    Area, 
+    XAxis, 
+    YAxis, 
+    CartesianGrid, 
+    Tooltip, 
+    ResponsiveContainer, 
+    ReferenceLine 
+} from 'recharts'
 
 function MeetingDetail() {
 
@@ -93,12 +104,83 @@ function MeetingDetail() {
                                         </div>
                                     ) : meetingData?.processed ? (
                                         <div className='space-y-6'>
+                                            {/* 1. Standard Summary */}
                                             {meetingData.summary && (
                                                 <div className='bg-card border border-border rounded-lg p-6'>
                                                     <h3 className='text-lg font-semibold text-foreground mb-3'>Meeting Summary</h3>
                                                     <p className='text-muted-foreground leading-relaxed'>
                                                         {meetingData.summary}
                                                     </p>
+                                                </div>
+                                            )}
+
+                                            {/* 2. 🔥 The Devil's Advocate Analysis */}
+                                            {(meetingData as any).riskAnalysis && (
+                                                <div className="border-l-4 border-red-500 bg-red-50 dark:bg-red-950/10 p-6 rounded-r-lg shadow-sm">
+                                                    <div className="flex items-center gap-2 mb-4">
+                                                        <AlertTriangle className="h-6 w-6 text-red-600 dark:text-red-400" />
+                                                        <h2 className="text-xl font-bold text-red-600 dark:text-red-400">The Devil's Advocate Analysis</h2>
+                                                    </div>
+                                                    
+                                                    <div 
+                                                        className="prose prose-sm max-w-none text-gray-700 dark:text-gray-300
+                                                        prose-h3:text-lg prose-h3:font-semibold prose-h3:mt-4 prose-h3:mb-2
+                                                        prose-ul:list-disc prose-ul:pl-5 prose-li:mb-1
+                                                        prose-strong:font-bold prose-strong:text-foreground"
+                                                        dangerouslySetInnerHTML={{ __html: (meetingData as any).riskAnalysis }} 
+                                                    />
+                                                    
+                                                    <div className="mt-4 text-xs text-gray-400 italic border-t border-red-200 dark:border-red-900/30 pt-2">
+                                                        * AI-generated risk assessment based on critical transcript analysis.
+                                                    </div>
+                                                </div>
+                                            )}
+
+                                            {/* 3. 📈 Sentiment Arc (Research Feature) */}
+                                            {(meetingData as any).sentimentData && (meetingData as any).sentimentData.length > 0 && (
+                                                <div className="bg-card border border-border rounded-lg p-6">
+                                                    <div className="flex items-center gap-2 mb-6">
+                                                        <span className="text-2xl">❤️</span>
+                                                        <div>
+                                                            <h3 className="text-lg font-semibold text-foreground">Emotional Arc</h3>
+                                                            <p className="text-xs text-muted-foreground">The emotional heartbeat of the meeting over time.</p>
+                                                        </div>
+                                                    </div>
+
+                                                    <div className="h-[250px] w-full">
+                                                        <ResponsiveContainer width="100%" height="100%">
+                                                            <AreaChart data={(meetingData as any).sentimentData}>
+                                                                <defs>
+                                                                    <linearGradient id="colorScore" x1="0" y1="0" x2="0" y2="1">
+                                                                        <stop offset="5%" stopColor="#10b981" stopOpacity={0.3}/>
+                                                                        <stop offset="95%" stopColor="#ef4444" stopOpacity={0.3}/>
+                                                                    </linearGradient>
+                                                                </defs>
+                                                                <CartesianGrid strokeDasharray="3 3" opacity={0.1} />
+                                                                <XAxis 
+                                                                    dataKey="timestamp" 
+                                                                    tickFormatter={(val) => `${Math.floor(val/60)}m`} 
+                                                                    stroke="#888888" 
+                                                                    fontSize={12}
+                                                                />
+                                                                <YAxis domain={[-1, 1]} hide />
+                                                                <Tooltip 
+                                                                    contentStyle={{ backgroundColor: '#1e293b', border: 'none', borderRadius: '8px' }}
+                                                                    itemStyle={{ color: '#fff' }}
+                                                                    formatter={(value: any) => [value, 'Sentiment Score']}
+                                                                    labelFormatter={(label) => `${Math.floor(Number(label)/60)}:00`}
+                                                                />
+                                                                <ReferenceLine y={0} stroke="#666" strokeDasharray="3 3" />
+                                                                <Area 
+                                                                    type="monotone" 
+                                                                    dataKey="score" 
+                                                                    stroke="#3b82f6" 
+                                                                    strokeWidth={2}
+                                                                    fill="url(#colorScore)" 
+                                                                />
+                                                            </AreaChart>
+                                                        </ResponsiveContainer>
+                                                    </div>
                                                 </div>
                                             )}
 
@@ -133,12 +215,9 @@ function MeetingDetail() {
                                                                     <div key={item.id} className='flex items-start gap-3'>
                                                                         <div className='w-2 h-2 rounded-full bg-primary mt-2 flex-shrink-0'></div>
                                                                         <p className='text-sm text-foreground'>{item.text}</p>
-
                                                                     </div>
                                                                 ))}
-
                                                             </div>
-
                                                         </div>
                                                     )}
                                                 </>
@@ -149,7 +228,6 @@ function MeetingDetail() {
                                             <div className='animate-spin rounded-full h-8 w-8 border-b-2 border-primary mx-auto mb-4'></div>
                                             <p className='text-muted-foreground'>Processing meeting with AI..</p>
                                             <p className='text-sm text-muted-foreground mt-2'>You'll receive an email when ready</p>
-
                                         </div>
                                     )}
                                 </div>
@@ -166,7 +244,7 @@ function MeetingDetail() {
                                         <TranscriptDisplay transcript={meetingData.transcript} />
                                     ) : (
                                         <div className='bg-card rounded-lg p-6 border border-border text-center'>
-                                            <p className='text-muted-foreground'>No transcript avaialable</p>
+                                            <p className='text-muted-foreground'>No transcript available</p>
                                         </div>
                                     )}
                                 </div>

@@ -5,12 +5,12 @@ export async function GET() {
     const { userId } = await auth()
 
     if (!userId) {
-        return NextResponse.redirect(new URL('/sign-in', process.env.NEXT_PUBLIC_APP_URL))
+        return NextResponse.redirect(new URL('/sign-in', process.env.NEXT_PUBLIC_APP_URI))
     }
 
     const clientId = process.env.ASANA_CLIENT_ID
 
-    const redirectUri = `${process.env.NEXT_PUBLIC_APP_URL}/api/integrations/asana/callback`
+    const redirectUri = `${process.env.NEXT_PUBLIC_APP_URI}/api/integrations/asana/callback`
 
     const scope = 'projects:read projects:write tasks:read tasks:write users:read workspaces:read'
 

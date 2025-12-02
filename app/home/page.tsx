@@ -1,35 +1,27 @@
 'use client'
 
 import React from 'react'
-import { useMeetings } from './hooks/useMeetings'
+import { useMeetings } from './hooks/useMeetings' 
 import { useRouter } from 'next/navigation'
 import PastMeetings from './components/PastMeetings'
 import UpcomingMeetings from './components/UpcomingMeetings'
+import GraphVisualization from '@/components/GraphVisualization' // 👈 IMPORT THIS
 
 function Home() {
-
     const {
         userId,
-        upcomingEvents,
         pastMeetings,
-        loading,
         pastLoading,
-        connected,
-        error,
-        botToggles,
-        initialLoading,
-        fetchUpcomingEvents,
-        fetchPastMeetings,
-        toggleBot,
-        directOAuth,
         getAttendeeList,
         getInitials
     } = useMeetings()
 
     const router = useRouter()
+    
     const handleMeetingClick = (meetingId: string) => {
         router.push(`/meeting/${meetingId}`)
     }
+
     if (!userId) {
         return (
             <div className='flex items-center justify-center h-screen'>
@@ -39,8 +31,15 @@ function Home() {
     }
 
     return (
-        <div className='min-h-screen bg-background'>
-            <div className='flex gap-6 p-6'>
+        <div className='min-h-screen bg-background p-6'>
+            
+            {/* 1. 🕸️ KNOWLEDGE GRAPH SECTION (NEW) */}
+            <div className="mb-8">
+                <GraphVisualization />
+            </div>
+
+            <div className='flex gap-6'>
+                {/* 2. Left Side: Past Meetings */}
                 <div className='flex-1'>
                     <div className='mb-6'>
                         <h2 className='text-2xl font-bold text-foreground'>
@@ -55,20 +54,13 @@ function Home() {
                         getInitials={getInitials}
                     />
                 </div>
+
                 <div className='w-px bg-border'></div>
+
+                {/* 3. Right Side: Upcoming Meetings */}
                 <div className='w-96'>
                     <div className='sticky top-6'>
-                        <UpcomingMeetings
-                            upcomingEvents={upcomingEvents}
-                            connected={connected}
-                            error={error}
-                            loading={loading}
-                            initialLoading={initialLoading}
-                            botToggles={botToggles}
-                            onRefresh={fetchUpcomingEvents}
-                            onToggleBot={toggleBot}
-                            onConnectCalendar={directOAuth}
-                        />
+                        <UpcomingMeetings />
                     </div>
                 </div>
             </div>

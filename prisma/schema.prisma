@@ -75,6 +75,8 @@ model Meeting {
   transcript      Json?
   recordingUrl    String?
   speakers        Json?
+  riskAnalysis String? @db.Text
+  sentimentData Json?
 
   summary        String?
   actionItems    Json?

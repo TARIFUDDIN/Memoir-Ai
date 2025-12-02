@@ -1,7 +1,6 @@
 {
     "name": "bot-scheduler-lambda",
     "version": "1.0.0",
-    "type": "module",
     "dependencies": {
         "@prisma/client": "^5.0.0",
         "prisma": "^5.0.0",

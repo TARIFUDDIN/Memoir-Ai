@@ -11,7 +11,7 @@ export async function GET(request: NextRequest) {
     const state = searchParams.get('state')
 
     if (!userId || !code || state !== userId) {
-        return NextResponse.redirect(new URL('/integrations?error=auth_failed', process.env.NEXT_PUBLIC_APP_URL))
+        return NextResponse.redirect(new URL('/integrations?error=auth_failed', process.env.NEXT_PUBLIC_APP_URI))
     }
 
     try {
@@ -24,7 +24,7 @@ export async function GET(request: NextRequest) {
                 grant_type: 'authorization_code',
                 client_id: process.env.ASANA_CLIENT_ID!,
                 client_secret: process.env.ASANA_CLIENT_SECRET!,
-                redirect_uri: `${process.env.NEXT_PUBLIC_APP_URL}/api/integrations/asana/callback`,
+                redirect_uri: `${process.env.NEXT_PUBLIC_APP_URI}/api/integrations/asana/callback`,
                 code: code
             })
         })
@@ -55,9 +55,9 @@ export async function GET(request: NextRequest) {
             }
         })
 
-        return NextResponse.redirect(new URL('/integrations?success=asana_connected&setup=asana', process.env.NEXT_PUBLIC_APP_URL))
+        return NextResponse.redirect(new URL('/integrations?success=asana_connected&setup=asana', process.env.NEXT_PUBLIC_APP_URI))
     } catch (error) {
         console.error('error saving asana integration:', error)
-        return NextResponse.redirect(new URL('/integrations?error=save_failed', process.env.NEXT_PUBLIC_APP_URL))
+        return NextResponse.redirect(new URL('/integrations?error=save_failed', process.env.NEXT_PUBLIC_APP_URI))
     }
 }

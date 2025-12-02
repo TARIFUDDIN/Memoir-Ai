@@ -11,7 +11,7 @@ export async function GET(request: NextRequest) {
     const state = searchParams.get('state')
 
     if (!userId || !code || state !== userId) {
-        return NextResponse.redirect(new URL('/integrations?error=auth_failed', process.env.NEXT_PUBLIC_APP_URL))
+        return NextResponse.redirect(new URL('/integrations?error=auth_failed', process.env.NEXT_PUBLIC_APP_URI))
     }
 
     try {
@@ -24,7 +24,7 @@ export async function GET(request: NextRequest) {
                 grant_type: 'authorization_code',
                 client_id: process.env.JIRA_CLIENT_ID!,
                 client_secret: process.env.JIRA_CLIENT_SECRET!,
-                redirect_uri: `${process.env.NEXT_PUBLIC_APP_URL}/api/integrations/jira/callback`,
+                redirect_uri: `${process.env.NEXT_PUBLIC_APP_URI}/api/integrations/jira/callback`,
                 code: code
             })
         })
@@ -79,9 +79,9 @@ export async function GET(request: NextRequest) {
             }
         })
 
-        return NextResponse.redirect(new URL('/integrations?success=jira_connected&setup=jira', process.env.NEXT_PUBLIC_APP_URL))
+        return NextResponse.redirect(new URL('/integrations?success=jira_connected&setup=jira', process.env.NEXT_PUBLIC_APP_URI))
     } catch (error) {
         console.error('error saving jira integration:', error)
-        return NextResponse.redirect(new URL('/integrations?error=save_failed', process.env.NEXT_PUBLIC_APP_URL))
+        return NextResponse.redirect(new URL('/integrations?error=save_failed', process.env.NEXT_PUBLIC_APP_URI))
     }
 }

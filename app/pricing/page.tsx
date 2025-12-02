@@ -12,7 +12,7 @@ const plans = [
         id: 'starter',
         name: 'Starter',
         price: 9,
-        priceId: 'price_1RpqPqPM25qIcCJyMdRhoNah',
+        priceId: 'price_1SWjV6SWzzLnK0uGK51aS6xD',
         description: 'Perfect for people getting started',
         features: [
             '10 meetings per month',
@@ -27,7 +27,7 @@ const plans = [
         id: 'pro',
         name: 'Pro',
         price: 29,
-        priceId: 'price_1RpqPqPM25qIcCJyWkSDTdKN',
+        priceId: 'price_1SWjVYSWzzLnK0uGd5Rs6GON',
         description: 'Perfect for people growing who need more power',
         features: [
             '30 meetings per month',
@@ -43,7 +43,7 @@ const plans = [
         id: 'premium',
         name: 'Premium',
         price: 99,
-        priceId: 'price_1RpqPqPM25qIcCJyXD9K1yKM',
+        priceId: 'price_1SWjVuSWzzLnK0uGFv10vELa',
         description: 'Perfect for people who need unlimited limits',
         features: [
             'Unlimited meetings per month',
