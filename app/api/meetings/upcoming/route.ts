@@ -10,6 +10,7 @@ export async function GET() {
             return NextResponse.json({ error: "Not authenticated" }, { status: 401 })
         }
 
+        // 1. Find User
         const user = await prisma.user.findUnique({
             where: { clerkId: userId }
         })
@@ -23,14 +24,11 @@ export async function GET() {
         // --- SYNC LOGIC ---
         try {
             const client = await clerkClient()
-            
-            // FIX 1: Use 'google' instead of 'oauth_google' (Fixes the Deprecation Warning)
-            // FIX 2: Wrap in try/catch to handle "Bad Request" when token is invalid
+            // Fix: Use 'google' (Fixes deprecation)
             const oauthTokens = await client.users.getUserOauthAccessToken(userId, 'google')
             
             if (oauthTokens.data.length > 0) {
                 const accessToken = oauthTokens.data[0].token
-                
                 const oauth2Client = new google.auth.OAuth2()
                 oauth2Client.setCredentials({ access_token: accessToken })
                 const calendar = google.calendar({ version: 'v3', auth: oauth2Client })
@@ -65,7 +63,8 @@ export async function GET() {
                                 meetingUrl: meetingUrl,
                             },
                             create: {
-                                userId: user.id,
+                                // ✅ FIXED: Use 'createdById' relation instead of 'userId'
+                                createdById: user.id, 
                                 title: event.summary || "Untitled Meeting",
                                 description: event.description || "",
                                 startTime: new Date(event.start.dateTime),
@@ -85,8 +84,7 @@ export async function GET() {
                 }
             }
         } catch (error) {
-            console.log("⚠️ Calendar Token Invalid - User needs to Reconnect:", error);
-            // Mark as disconnected in DB so UI shows "Connect Calendar" button
+            console.log("⚠️ Calendar Sync Issue:", error);
             if (user.calendarConnected) {
                 await prisma.user.update({ where: { id: user.id }, data: { calendarConnected: false } });
                 isCalendarConnected = false;
@@ -97,7 +95,7 @@ export async function GET() {
         const now = new Date()
         const upcomingMeetings = await prisma.meeting.findMany({
             where: {
-                userId: user.id,
+                createdById: user.id, // ✅ FIXED: Changed from userId to createdById
                 startTime: { gte: now },
                 meetingEnded: false 
             },
@@ -117,7 +115,7 @@ export async function GET() {
 
         return NextResponse.json({
             events,
-            connected: isCalendarConnected, // Tells frontend to show "Connect" button if false
+            connected: isCalendarConnected,
             source: 'synced-database'
         })
 

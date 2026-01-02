@@ -16,10 +16,21 @@ export async function POST(
 
         const { text } = await request.json()
         const { meetingId } = await params
+        
+        // 1. Find User (Need DB ID, not Clerk ID)
+        const user = await prisma.user.findUnique({
+            where: { clerkId: userId }
+        })
+
+        if (!user) {
+            return NextResponse.json({ error: 'user not found' }, { status: 404 })
+        }
+
+        // 2. Find Meeting (Using createdById instead of userId)
         const meeting = await prisma.meeting.findFirst({
             where: {
                 id: meetingId,
-                userId: userId
+                createdById: user.id // ✅ FIXED: Changed from userId to createdById
             }
         })
 
@@ -53,5 +64,4 @@ export async function POST(
         console.error('error adding action item', error)
         return NextResponse.json({ error: 'internal error' }, { status: 500 })
     }
-
 }

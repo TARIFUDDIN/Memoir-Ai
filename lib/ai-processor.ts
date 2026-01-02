@@ -154,79 +154,172 @@ export async function generateRiskAnalysis(
 }
 
 // ---------------------------------------------------------
-// 📈 RESEARCH FEATURE: TEMPORAL SENTIMENT MAPPING
+// 📈 UPGRADE: MULTI-SPEAKER SENTIMENT ANALYSIS
 // ---------------------------------------------------------
 export async function generateSentimentArc(transcript: any, meetingId: string) {
   try {
-    // 1. Prepare Data: We need a list of sentences/segments
-    let segments: any[] = [];
+    if (!Array.isArray(transcript)) return null;
 
-    if (Array.isArray(transcript)) {
-      // If transcript is structured (MeetingBaas format)
-      segments = transcript.map((t: any) => ({
-        speaker: t.speaker,
-        text: t.words.map((w: any) => w.word).join(" "),
-        timestamp: t.words[0]?.start_time || 0, // Assuming seconds
-      }));
-    } else {
-      // Fallback for raw text (split by newlines)
-      const lines = typeof transcript === 'string' ? transcript.split("\n") : [];
-      segments = lines.map((line: string, index: number) => ({
-        speaker: "Unknown",
-        text: line,
-        timestamp: index * 60, // Fake timestamp if missing
-      }));
-    }
+    // 1. Determine Meeting Duration & Window Size
+    // We'll analyze in 30-second chunks for high resolution
+    const lastSegment = transcript[transcript.length - 1];
+    const duration = lastSegment?.words
+      ? lastSegment.words[lastSegment.words.length - 1].end_time
+      : 0;
+    const windowSize = 30;
+    const windows = [];
 
-    // Optimization: Group segments to reduce API calls (Batch Processing)
-    const batchSize = 15;
-    const sentimentResults = [];
+    // 2. Slice Transcript into Time Windows
+    for (let t = 0; t < duration; t += windowSize) {
+      const windowEnd = t + windowSize;
 
-    for (let i = 0; i < segments.length; i += batchSize) {
-      const batch = segments.slice(i, i + batchSize);
-      
-      // We only send ID and Text to OpenAI to save tokens
-      const batchPayload = batch.map((s) => ({
-        id: s.timestamp,
-        text: s.text,
-      }));
-
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: `Analyze the sentiment of each dialogue segment.
-            Return a JSON object where keys are the timestamps and values are a score from -1.0 (Negative/Angry) to 1.0 (Positive/Excited). 0 is Neutral.
-            
-            Example Input: [{"id": 10, "text": "This is a disaster"}]
-            Example Output: {"10": -0.9}`,
-          },
-          { role: "user", content: JSON.stringify(batchPayload) },
-        ],
-        response_format: { type: "json_object" },
+      // Get all words spoken in this timeframe
+      const segmentsInWindow = transcript.filter((item: any) => {
+        const start = item.words[0]?.start_time || 0;
+        return start >= t && start < windowEnd;
       });
 
-      const scores = JSON.parse(completion.choices[0].message.content || "{}");
+      // If silence, skip or push empty
+      if (segmentsInWindow.length === 0) continue;
 
-      // Merge scores back into segments
-      const processedBatch = batch.map((s) => ({
-        ...s,
-        score: scores[s.timestamp] || 0,
-      }));
+      // Format: "SpeakerName: Text..."
+      const textPayload = segmentsInWindow
+        .map(
+          (s: any) =>
+            `${s.speaker}: ${s.words.map((w: any) => w.word).join(" ")}`
+        )
+        .join("\n");
 
-      sentimentResults.push(...processedBatch);
+      windows.push({ timestamp: t, text: textPayload });
     }
 
-    // Save to DB
-    await prisma.meeting.update({
-      where: { id: meetingId },
-      data: { sentimentData: sentimentResults },
+    // 3. Batch Process with OpenAI (5 windows at a time to save API calls)
+    const sentimentData: any[] = [];
+    const batchSize = 5;
+
+    for (let i = 0; i < windows.length; i += batchSize) {
+      const batch = windows.slice(i, i + batchSize);
+
+      try {
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4o-mini", // Fast & Cheap
+          messages: [
+            {
+              role: "system",
+              content: `You are an emotional intelligence AI. Analyze the dialogue segment.
+              For EACH speaker, determine their sentiment score (-1.0 = Negative/Angry, 0.0 = Neutral, 1.0 = Positive/Happy).
+              
+              Return ONLY a JSON Object keyed by timestamp.
+              Example Input: 
+              [{ "timestamp": 60, "text": "Tarif: This code is broken! \n Subhadeep: I can fix it." }]
+              
+              Example Output:
+              {
+                "60": { "Tarif": -0.8, "Subhadeep": 0.4 }
+              }`,
+            },
+            { role: "user", content: JSON.stringify(batch) },
+          ],
+          response_format: { type: "json_object" },
+        });
+
+        const batchResults = JSON.parse(
+          completion.choices[0].message.content || "{}"
+        );
+
+        // Merge results back into our timeline
+        batch.forEach((window) => {
+          const scores = batchResults[window.timestamp] || {};
+          // Format for Recharts: { timestamp: 60, Tarif: -0.8, Subhadeep: 0.4 }
+          sentimentData.push({
+            timestamp: window.timestamp,
+            ...scores,
+          });
+        });
+      } catch (err) {
+        console.error("Batch sentiment failed", err);
+      }
+    }
+
+    // 4. Save to Database
+    if (sentimentData.length > 0) {
+      await prisma.meeting.update({
+        where: { id: meetingId },
+        data: { sentimentData },
+      });
+    }
+
+    return sentimentData;
+  } catch (error) {
+    console.error("Sentiment Arc Error:", error);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------
+// 🧠 BEHAVIORAL PROFILING AGENT (Psychometric Analysis)
+// ---------------------------------------------------------
+export async function generateSpeakerProfiles(
+  transcript: any,
+  meetingId: string
+) {
+  try {
+    let transcriptText = "";
+
+    if (Array.isArray(transcript)) {
+      transcriptText = transcript
+        .map(
+          (item: any) =>
+            `${item.speaker || "Speaker"}: ${item.words
+              .map((w: any) => w.word)
+              .join(" ")}`
+        )
+        .join("\n");
+    } else if (typeof transcript === "string") {
+      transcriptText = transcript;
+    }
+
+    const truncatedTranscript = transcriptText.substring(0, 20000);
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `You are an expert Organizational Psychologist. 
+                    Analyze the meeting transcript and generate a behavioral profile for every unique speaker.
+
+                    For each speaker, determine:
+                    1. **Role**: What role did they play? (e.g., Leader, Critic, Mediator)
+                    2. **Sentiment**: Overall emotional tone (Positive, Neutral, Negative).
+                    3. **Key Trait**: One specific adjective describing their style.
+                    4. **Feedback**: One sentence of feedback.
+
+                    Return a JSON Object where keys are speaker names.
+                    Example:
+                    {
+                        "Tarif": { "role": "Leader", "sentiment": "Positive", "trait": "Visionary", "feedback": "Good energy." }
+                    }`,
+        },
+        {
+          role: "user",
+          content: truncatedTranscript,
+        },
+      ],
+      temperature: 0.5,
+      response_format: { type: "json_object" },
     });
 
-    return sentimentResults;
+    const profiles = JSON.parse(completion.choices[0].message.content || "{}");
+
+    await prisma.meeting.update({
+      where: { id: meetingId },
+      data: { speakerProfiles: profiles },
+    });
+
+    return profiles;
   } catch (error) {
-    console.error("Sentiment Mapping Failed:", error);
+    console.error("Error generating speaker profiles:", error);
     return null;
   }
 }

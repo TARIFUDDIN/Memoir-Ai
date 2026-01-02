@@ -9,23 +9,35 @@ export interface MeetingData {
     description?: string
     startTime: string
     endTime: string
+    
+    // AI Assets
     transcript?: any
     summary?: string
     actionItems?: Array<{
         id: number
         text: string
     }>
+    
+    // processing flags
     processed: boolean
     processedAt?: string
     recordingUrl?: string
     emailSent: boolean
     emailSentAt?: string
+    ragProcessed?: boolean
+
+    // User/Owner info
     userId?: string
     user?: {
         name?: string
         email?: string
     }
-    ragProcessed?: boolean
+
+    // 👇 NEW FIELDS (Required for Sentiment Arc & Risk Analysis)
+    sentimentData?: any[]       // Dynamic array for multi-speaker sentiment
+    riskAnalysis?: string       // HTML string for Devil's Advocate
+    botScheduled?: boolean      // Toggle status
+    botId?: string              // Meeting Baas ID
 }
 
 export function useMeetingDetail() {

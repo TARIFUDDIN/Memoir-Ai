@@ -1,161 +1,103 @@
-import { 
-  processMeetingTranscript, 
-  generateRiskAnalysis, 
-  generateSentimentArc 
-} from "@/lib/ai-processor"; // ✅ Updated import
 import { prisma } from "@/lib/db";
-import { sendMeetingSummaryEmail } from "@/lib/email-service-free";
-import { processTranscript } from "@/lib/rag";
 import { incrementMeetingUsage } from "@/lib/usage";
 import { NextRequest, NextResponse } from "next/server";
-import { addToKnowledgeGraph } from "@/lib/graph"; 
+import { Client } from "@upstash/qstash";
+import crypto from "crypto";
+
+// Initialize Queue Client
+const client = new Client({ token: process.env.QSTASH_TOKEN! });
 
 export async function POST(request: NextRequest) {
-  try {
-    const webhook = await request.json()
+    try {
+        // 1. Read Raw Body (Needed for Signature Verification)
+        const bodyText = await request.text();
+        
+        // 2. Security: Verify Signature
+        // We check if the request actually came from Meeting Baas using your Secret
+        const signature = request.headers.get("x-meeting-baas-signature");
+        const secret = process.env.MEETING_BAAS_WEBHOOK_SECRET;
 
-    if (webhook.event === 'complete') {
-      const webhookData = webhook.data
-
-      const meeting = await prisma.meeting.findFirst({
-        where: {
-          botId: webhookData.bot_id
-        },
-        include: {
-          user: true
+        if (!secret) {
+            console.warn("⚠️ MEETING_BAAS_WEBHOOK_SECRET is missing in .env. Skipping verification.");
+        } else if (!signature) {
+             return NextResponse.json({ error: "Missing signature header" }, { status: 401 });
+        } else {
+            // Verify HMAC-SHA256 Signature
+            const hmac = crypto.createHmac("sha256", secret);
+            const digest = hmac.update(bodyText).digest("hex");
+            
+            if (digest !== signature) {
+                console.error("❌ Invalid Webhook Signature. Potential attack.");
+                return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
+            }
         }
-      })
 
-      if (!meeting) {
-        console.error('meeting not found for bot id:', webhookData.bot_id)
-        return NextResponse.json({ error: 'meeting not found' }, { status: 404 })
-      }
+        // 3. Parse JSON from the raw body
+        const webhook = JSON.parse(bodyText);
 
-      await incrementMeetingUsage(meeting.userId)
+        if (webhook.event === 'complete') {
+            const webhookData = webhook.data;
+            
+            console.log(`🔔 Webhook Received for Bot ID: ${webhookData.bot_id}`);
 
-      if (!meeting.user.email) {
-        console.error('user email not found for this meeting', meeting.id)
-        return NextResponse.json({ error: 'user email not found' }, { status: 400 })
-      }
+            // 4. Find Meeting (Fixed Prisma Relations)
+            const meeting = await prisma.meeting.findFirst({
+                where: { botId: webhookData.bot_id },
+                include: { createdBy: true } // ✅ Fixed: 'user' -> 'createdBy' based on your schema
+            });
 
-      // Update basic meeting info immediately
-      await prisma.meeting.update({
-        where: { id: meeting.id },
-        data: {
-          meetingEnded: true,
-          transcriptReady: true,
-          transcript: webhookData.transcript || null,
-          recordingUrl: webhookData.mp4 || null,
-          speakers: webhookData.speakers || null
-        }
-      })
+            if (!meeting) {
+                console.error('❌ Meeting not found for bot id:', webhookData.bot_id);
+                return NextResponse.json({ error: 'meeting not found' }, { status: 404 });
+            }
 
-      // ---------------------------------------------------
-      // PROCESS TRANSCRIPT (SUMMARY + EMAIL + RAG + AGENTS)
-      // ---------------------------------------------------
-      if (webhookData.transcript && !meeting.processed) {
-        try {
-          // 1️⃣ Generate standard summary
-          const processed = await processMeetingTranscript(webhookData.transcript)
-
-          let transcriptText = ''
-          if (Array.isArray(webhookData.transcript)) {
-            transcriptText = webhookData.transcript
-              .map((item: any) => `${item.speaker || 'Speaker'}: ${item.words.map((w: any) => w.word).join(' ')}`)
-              .join('\n')
-          } else {
-            transcriptText = webhookData.transcript
-          }
-
-          // 2️⃣ Send Email
-          try {
-            await sendMeetingSummaryEmail({
-              userEmail: meeting.user.email,
-              userName: meeting.user.name || 'User',
-              meetingTitle: meeting.title,
-              summary: processed.summary,
-              actionItems: processed.actionItems,
-              meetingId: meeting.id,
-              meetingDate: meeting.startTime.toLocaleDateString()
-            })
-
+            // 5. Immediate Updates (Fast DB operations only)
+            // ✅ Fixed: 'userId' -> 'createdById' based on your schema
+            await incrementMeetingUsage(meeting.createdById);
+            
             await prisma.meeting.update({
-              where: { id: meeting.id },
-              data: { emailSent: true, emailSentAt: new Date() }
-            })
-          } catch (emailError) {
-            console.error('failed to send the email:', emailError)
-          }
+                where: { id: meeting.id },
+                data: {
+                    meetingEnded: true,
+                    transcriptReady: true,
+                    // Store raw data immediately
+                    transcript: webhookData.transcript, 
+                    recordingUrl: webhookData.mp4,
+                    speakers: webhookData.speakers
+                }
+            });
 
-          // 3️⃣ Process Vector RAG (Standard)
-          await processTranscript(meeting.id, meeting.userId, transcriptText, meeting.title)
-
-          // 4️⃣ SAVE SUMMARY + ACTION ITEMS
-          await prisma.meeting.update({
-            where: { id: meeting.id },
-            data: {
-              summary: processed.summary,
-              actionItems: processed.actionItems,
-              processed: true,
-              processedAt: new Date(),
-              ragProcessed: true,
-              ragProcessedAt: new Date()
+            // 6. 🚀 DISPATCH TO ASYNC QUEUE (QStash)
+            // We do NOT process AI here. We send it to a background worker.
+            const appUrl = process.env.NEXT_PUBLIC_APP_URI; 
+            
+            try {
+                const response = await client.publishJSON({
+                    url: `${appUrl}/api/queue/process-meeting`,
+                    body: {
+                        meetingId: meeting.id,
+                        transcript: webhookData.transcript,
+                        botId: webhookData.bot_id,
+                        meetingTitle: meeting.title 
+                    },
+                    retries: 3 // Auto-retry if AI fails
+                });
+                
+                console.log(`📨 Job sent to Queue (Msg ID: ${response.messageId}) for Meeting: ${meeting.id}`);
+            
+            } catch (queueError) {
+                console.error("❌ Failed to queue job:", queueError);
+                // We still return success to MeetingBaas so they stop retrying the webhook
             }
-          })
 
-          // ---------------------------------------------------
-          // 🔥 5️⃣ TRIGGER DEVIL’S ADVOCATE (Risk Analysis)
-          // ---------------------------------------------------
-          console.log("😈 Triggering Devil's Advocate Agent...")
-          generateRiskAnalysis(webhookData.transcript, meeting.id)
-            .then(() => console.log("😈 Risk Analysis Saved"))
-            .catch(e => console.error("😈 Risk Analysis Failed:", e));
-
-          // ---------------------------------------------------
-          // 🕸️ 6️⃣ TRIGGER KNOWLEDGE GRAPH (Neo4j)
-          // ---------------------------------------------------
-          console.log("🕸️ Triggering Graph Extraction...");
-          addToKnowledgeGraph(webhookData.transcript, meeting.id, meeting.title)
-            .then(() => console.log("🕸️ Graph Populated Successfully"))
-            .catch(e => console.error("🕸️ Graph Failed:", e));
-
-          // ---------------------------------------------------
-          // 📈 7️⃣ TRIGGER SENTIMENT MAPPING (Temporal)
-          // ---------------------------------------------------
-          console.log("📈 Triggering Sentiment Mapping...");
-          generateSentimentArc(webhookData.transcript, meeting.id)
-            .then(() => console.log("📈 Sentiment Data Saved"))
-            .catch(e => console.error("📈 Sentiment Failed", e));
-
-        } catch (processingError) {
-          console.error('failed to process the transcript:', processingError)
-
-          await prisma.meeting.update({
-            where: { id: meeting.id },
-            data: {
-              processed: true,
-              processedAt: new Date(),
-              summary: 'processing failed. please check the transcript manually.',
-              actionItems: []
-            }
-          })
+            return NextResponse.json({ success: true, message: 'Queued for processing' });
         }
-      }
 
-      return NextResponse.json({
-        success: true,
-        message: 'meeting processed succesfully',
-        meetingId: meeting.id
-      })
+        // Handle other events (failed, etc.) or just acknowledge
+        return NextResponse.json({ success: true });
+
+    } catch (error) {
+        console.error('Webhook error:', error);
+        return NextResponse.json({ error: 'Internal Error' }, { status: 500 });
     }
-
-    return NextResponse.json({
-      success: true,
-      message: 'webhook received but no action needed bro'
-    })
-
-  } catch (error) {
-    console.error('webhook processing error:', error)
-    return NextResponse.json({ error: 'internal server error' }, { status: 500 })
-  }
 }

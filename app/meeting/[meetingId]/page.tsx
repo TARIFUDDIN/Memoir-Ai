@@ -1,6 +1,6 @@
 'use client'
 
-import React from 'react'
+import React, { useMemo } from 'react'
 import { useMeetingDetail } from './hooks/useMeetingDetail'
 import MeetingHeader from './components/MeetingHeader'
 import MeetingInfo from './components/MeetingInfo'
@@ -18,8 +18,12 @@ import {
     CartesianGrid, 
     Tooltip, 
     ResponsiveContainer, 
-    ReferenceLine 
+    ReferenceLine,
+    Legend 
 } from 'recharts'
+
+// Distinct colors for different speakers
+const SPEAKER_COLORS = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899'];
 
 function MeetingDetail() {
 
@@ -44,6 +48,17 @@ function MeetingDetail() {
         meetingInfoData
     } = useMeetingDetail()
 
+    // 🧠 DYNAMIC SPEAKER EXTRACTION
+    // This logic finds all unique keys (speakers) in your sentiment data
+    // excluding 'timestamp' and 'name'.
+    const sentimentSpeakers = useMemo(() => {
+        if (!meetingData?.sentimentData || !Array.isArray(meetingData.sentimentData) || meetingData.sentimentData.length === 0) {
+            return [];
+        }
+        const firstPoint = meetingData.sentimentData[0];
+        return Object.keys(firstPoint).filter(key => key !== 'timestamp' && key !== 'name');
+    }, [meetingData]);
+
     return (
         <div className='min-h-screen bg-background'>
 
@@ -51,7 +66,7 @@ function MeetingDetail() {
                 title={meetingData?.title || 'Meeting'}
                 meetingId={meetingId}
                 summary={meetingData?.summary}
-                actionItems={meetingData?.actionItems?.map(item => `• ${item.text}`).join('\n') || ''}
+                actionItems={meetingData?.actionItems?.map((item: any) => `• ${item.text}`).join('\n') || ''}
                 isOwner={isOwner}
                 isLoading={!userChecked}
             />
@@ -71,9 +86,9 @@ function MeetingDetail() {
                                 onClick={() => setActiveTab('summary')}
                                 className={`px-4 py-2 text-sm font-medium border-b-2 rounded-none shadow-none transition-colors
                                 ${activeTab === 'summary'
-                                        ? 'border-primary text-primary'
-                                        : 'border-transparent text-muted-foreground hover:text-foreground hover:border-muted-foreground/50'
-                                    }`}
+                                    ? 'border-primary text-primary'
+                                    : 'border-transparent text-muted-foreground hover:text-foreground hover:border-muted-foreground/50'
+                                }`}
                                 style={{ boxShadow: 'none' }}
                                 type='button'
                             >
@@ -84,9 +99,9 @@ function MeetingDetail() {
                                 onClick={() => setActiveTab('transcript')}
                                 className={`px-4 py-2 text-sm font-medium border-b-2 rounded-none shadow-none transition-colors
                                 ${activeTab === 'transcript'
-                                        ? 'border-primary text-primary'
-                                        : 'border-transparent text-muted-foreground hover:text-foreground hover:border-muted-foreground/50'
-                                    }`}
+                                    ? 'border-primary text-primary'
+                                    : 'border-transparent text-muted-foreground hover:text-foreground hover:border-muted-foreground/50'
+                                }`}
                                 style={{ boxShadow: 'none' }}
                                 type='button'
                             >
@@ -136,26 +151,29 @@ function MeetingDetail() {
                                                 </div>
                                             )}
 
-                                            {/* 3. 📈 Sentiment Arc (Research Feature) */}
+                                            {/* 3. 📈 Advanced Sentiment Arc (Multi-Speaker) */}
                                             {(meetingData as any).sentimentData && (meetingData as any).sentimentData.length > 0 && (
                                                 <div className="bg-card border border-border rounded-lg p-6">
                                                     <div className="flex items-center gap-2 mb-6">
                                                         <span className="text-2xl">❤️</span>
                                                         <div>
                                                             <h3 className="text-lg font-semibold text-foreground">Emotional Arc</h3>
-                                                            <p className="text-xs text-muted-foreground">The emotional heartbeat of the meeting over time.</p>
+                                                            <p className="text-xs text-muted-foreground">Sentiment tracking per speaker over time.</p>
                                                         </div>
                                                     </div>
 
-                                                    <div className="h-[250px] w-full">
+                                                    <div className="h-[300px] w-full">
                                                         <ResponsiveContainer width="100%" height="100%">
                                                             <AreaChart data={(meetingData as any).sentimentData}>
                                                                 <defs>
-                                                                    <linearGradient id="colorScore" x1="0" y1="0" x2="0" y2="1">
-                                                                        <stop offset="5%" stopColor="#10b981" stopOpacity={0.3}/>
-                                                                        <stop offset="95%" stopColor="#ef4444" stopOpacity={0.3}/>
-                                                                    </linearGradient>
+                                                                    {sentimentSpeakers.map((speaker, index) => (
+                                                                        <linearGradient key={speaker} id={`color-${speaker}`} x1="0" y1="0" x2="0" y2="1">
+                                                                            <stop offset="5%" stopColor={SPEAKER_COLORS[index % SPEAKER_COLORS.length]} stopOpacity={0.3}/>
+                                                                            <stop offset="95%" stopColor={SPEAKER_COLORS[index % SPEAKER_COLORS.length]} stopOpacity={0}/>
+                                                                        </linearGradient>
+                                                                    ))}
                                                                 </defs>
+                                                                
                                                                 <CartesianGrid strokeDasharray="3 3" opacity={0.1} />
                                                                 <XAxis 
                                                                     dataKey="timestamp" 
@@ -164,20 +182,30 @@ function MeetingDetail() {
                                                                     fontSize={12}
                                                                 />
                                                                 <YAxis domain={[-1, 1]} hide />
+                                                                
                                                                 <Tooltip 
                                                                     contentStyle={{ backgroundColor: '#1e293b', border: 'none', borderRadius: '8px' }}
                                                                     itemStyle={{ color: '#fff' }}
-                                                                    formatter={(value: any) => [value, 'Sentiment Score']}
                                                                     labelFormatter={(label) => `${Math.floor(Number(label)/60)}:00`}
                                                                 />
+                                                                
+                                                                <Legend verticalAlign="top" height={36}/>
                                                                 <ReferenceLine y={0} stroke="#666" strokeDasharray="3 3" />
-                                                                <Area 
-                                                                    type="monotone" 
-                                                                    dataKey="score" 
-                                                                    stroke="#3b82f6" 
-                                                                    strokeWidth={2}
-                                                                    fill="url(#colorScore)" 
-                                                                />
+
+                                                                {/* 🎨 DYNAMICALLY RENDER LINES PER SPEAKER */}
+                                                                {sentimentSpeakers.map((speaker, index) => (
+                                                                    <Area 
+                                                                        key={speaker}
+                                                                        type="monotone" 
+                                                                        dataKey={speaker} // Matches the JSON key (e.g., "Tarif")
+                                                                        name={speaker}    // Shows in Legend
+                                                                        stroke={SPEAKER_COLORS[index % SPEAKER_COLORS.length]} 
+                                                                        strokeWidth={2}
+                                                                        fill={`url(#color-${speaker})`} 
+                                                                        connectNulls={true} // Connects lines if a speaker is silent for a bit
+                                                                        fillOpacity={0.2}
+                                                                    />
+                                                                ))}
                                                             </AreaChart>
                                                         </ResponsiveContainer>
                                                     </div>
