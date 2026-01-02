@@ -20,7 +20,8 @@ export default clerkMiddleware(async (auth, req) => {
     // ---------------------------------------------------------
     // 1. RATE LIMITING (Protect APIs)
     // ---------------------------------------------------------
-    if (isApiRoute(req) && userId) {
+    // ✅ FIX: Skip Rate Limiting completely in Development to prevent "Fetch Failed" errors
+    if (process.env.NODE_ENV !== 'development' && isApiRoute(req) && userId) {
         try {
             // Use userId as key. If not logged in, use IP.
             const identifier = userId || req.headers.get("x-forwarded-for") || "ip_unknown"
