@@ -168,6 +168,7 @@ Set Environment Variables in the AWS Console (Configuration -> Environment varia
 
 Configure AWS EventBridge to trigger the function on a schedule (e.g., every 5 minutes).
 
+Feel free to send pr with new ideas
 📄 License
 This project is licensed under the MIT License - see the LICENSE file for details.
 
