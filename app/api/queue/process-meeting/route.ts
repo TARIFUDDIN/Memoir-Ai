@@ -15,7 +15,8 @@ async function handler(req: NextRequest) {
     try {
         const meeting = await prisma.meeting.findUnique({
             where: { id: meetingId },
-            include: { user: true }
+            // ✅ FIX 1: Change 'user' to 'createdBy'
+            include: { createdBy: true }
         });
 
         if (!meeting) return NextResponse.json({ error: "Meeting not found" }, { status: 404 });
@@ -25,8 +26,9 @@ async function handler(req: NextRequest) {
 
         // 2. Send Email
         await sendMeetingSummaryEmail({
-            userEmail: meeting.user.email!,
-            userName: meeting.user.name || 'User',
+            // ✅ FIX 2: Change 'meeting.user' to 'meeting.createdBy'
+            userEmail: meeting.createdBy.email!,
+            userName: meeting.createdBy.name || 'User',
             meetingTitle: meeting.title,
             summary: processed.summary,
             actionItems: processed.actionItems,
@@ -46,10 +48,9 @@ async function handler(req: NextRequest) {
         });
 
         // 4. PARALLEL: Run all advanced AI tasks
-        // We use Promise.allSettled so if one fails, others still finish
         await Promise.allSettled([
-            // Vector RAG
-            processTranscript(meetingId, meeting.userId, JSON.stringify(transcript), meeting.title),
+            // ✅ FIX 3: Change 'meeting.userId' to 'meeting.createdById'
+            processTranscript(meetingId, meeting.createdById, JSON.stringify(transcript), meeting.title),
             
             // 😈 Risk Analysis
             generateRiskAnalysis(transcript, meetingId),
@@ -60,7 +61,7 @@ async function handler(req: NextRequest) {
             // 📈 Sentiment Arc
             generateSentimentArc(transcript, meetingId),
             
-            // 🧠 Behavioral Profiling (If you implemented it)
+            // 🧠 Behavioral Profiling
             generateSpeakerProfiles(transcript, meetingId)
         ]);
 

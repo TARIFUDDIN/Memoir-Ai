@@ -2,9 +2,7 @@ import { prisma } from "./db";
 import { chatWithAI, createEmbedding, createManyEmbeddings } from "./openai";
 import { saveManyVectors, searchVectors } from "./pinecone";
 import { chunkTranscript, extractSpeaker } from "./text-chunker";
-
 import { queryGraphMemory } from "./graph"; 
-
 export async function processTranscript(
     meetingId: string,
     userId: string,

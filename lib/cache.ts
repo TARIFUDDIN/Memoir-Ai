@@ -1,14 +1,8 @@
 import { Redis } from "@upstash/redis";
-
-// Initialize Redis
 const redis = Redis.fromEnv();
-
 export async function getCachedResponse(prompt: string, userId: string) {
     try {
-        // Create a unique key based on User + Prompt
-        // We sanitize the prompt to remove spaces/casing for better matching
         const sanitizedPrompt = prompt.trim().toLowerCase();
-        // Base64 encode the prompt to ensure it's a safe key string
         const key = `cache:${userId}:${Buffer.from(sanitizedPrompt).toString('base64')}`;
 
         const cached = await redis.get(key);
