@@ -124,7 +124,7 @@ async function processCalendarEvent(user, event) {
 
     const eventData = {
         calendarEventId: event.id,
-        createdById: user.id, // ✅ CORRECT: Uses the Main Schema field
+        createdById: user.id, 
         title: event.summary || 'Untitled Meeting',
         description: event.description || null,
         meetingUrl: meetingUrl,
@@ -160,11 +160,11 @@ async function processCalendarEvent(user, event) {
 async function scheduleBotsForUpcomingMeetings() {
     try {
         const now = new Date()
-        const checkWindow = new Date(now.getTime() + 15 * 60 * 1000)
+        // LOOK AHEAD 20 MINUTES (Increased buffer)
+        const checkWindow = new Date(now.getTime() + 20 * 60 * 1000)
 
         console.log(`🔍 [Schedule] Checking window: ${now.toISOString()} -> ${checkWindow.toISOString()}`)
 
-        // ✅ CORRECT: Uses 'createdBy' relation from Main Schema
         const upcomingMeetings = await prisma.meeting.findMany({
             where: {
                 startTime: { gte: now, lte: checkWindow },
@@ -179,7 +179,7 @@ async function scheduleBotsForUpcomingMeetings() {
         console.log(`🎯 [Schedule] Found ${upcomingMeetings.length} eligible meetings`)
 
         for (const meeting of upcomingMeetings) {
-            const user = meeting.createdBy; // ✅ CORRECT
+            const user = meeting.createdBy;
             
             console.log(`🚀 [Schedule] Attempting: "${meeting.title}" for ${user.email}`)
 
@@ -197,18 +197,28 @@ async function scheduleBotsForUpcomingMeetings() {
             console.log(`✅ [Schedule] Deploying bot...`)
             const botResponse = await deployBotToMeeting(meeting, user)
 
-            if (botResponse.success) {
+            // CRITICAL FIX: Log the entire response to debug
+            console.log("🔍 [DEBUG] Bot Response:", JSON.stringify(botResponse));
+
+            if (botResponse.success && botResponse.bot_id) {
                 console.log(`🎉 [Schedule] SUCCESS! Bot ID: ${botResponse.bot_id}`)
+                
+                // SAVE THE BOT ID TO DATABASE
                 await prisma.meeting.update({
                     where: { id: meeting.id },
-                    data: { botSent: true, botId: botResponse.bot_id, botJoinedAt: new Date() }
+                    data: { 
+                        botSent: true, 
+                        botId: botResponse.bot_id, // This MUST be saved
+                        botJoinedAt: new Date() 
+                    }
                 })
+                
                 await prisma.user.update({
                     where: { id: user.id },
                     data: { meetingsThisMonth: { increment: 1 } }
                 })
             } else {
-                console.error(`💀 [Schedule] FAILED: ${botResponse.error}`)
+                console.error(`💀 [Schedule] FAILED. ID Missing or Error: ${botResponse.error}`)
             }
         }
     } catch (error) {
@@ -218,10 +228,6 @@ async function scheduleBotsForUpcomingMeetings() {
 
 async function deployBotToMeeting(meeting, user) {
     try {
-        // Debug: Log API key being used
-        const key = process.env.MEETING_BAAS_API_KEY;
-        console.log(`🔑 DEBUG KEY BEING USED: ${key ? key.substring(0, 20) + "..." : "UNDEFINED"}`);
-
         const requestBody = {
             meeting_url: meeting.meetingUrl,
             bot_name: user.botName || 'Meeting Bot',
@@ -246,13 +252,23 @@ async function deployBotToMeeting(meeting, user) {
             body: JSON.stringify(requestBody)
         })
 
+        const rawText = await response.text();
+        console.log("🔍 [DEBUG] Raw API Response:", rawText);
+
         if (!response.ok) {
-            const error = await response.text()
-            return { success: false, error: `HTTP ${response.status}: ${error}` }
+            return { success: false, error: `HTTP ${response.status}: ${rawText}` }
         }
 
-        const data = await response.json()
-        return { success: true, bot_id: data.bot_id }
+        const json = JSON.parse(rawText);
+        
+        // ✅ FIX: Check inside 'data' object correctly
+        const finalBotId = json.bot_id || (json.data && json.data.bot_id) || json.id;
+
+        if (!finalBotId) {
+             return { success: false, error: "Bot ID not found in response" }
+        }
+
+        return { success: true, bot_id: finalBotId }
     } catch (error) {
         return { success: false, error: error.message }
     }
