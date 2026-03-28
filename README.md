@@ -1,7 +1,7 @@
 # Memoir-Ai
 ### The Open-Source Enterprise Meeting Intelligence Platform
 
-![Memoir-Ai Platform Overview](./public/images/meetingAI.svg)
+![Memoir-Ai Platform Overview](./public/images/MeetingAi.png)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Next.js](https://img.shields.io/badge/Next.js-15.0-black)](https://nextjs.org/)
@@ -15,7 +15,7 @@
 
 > [!IMPORTANT]
 > **Academic Foundation:** This project is backed by deep research into Cognitive Intelligence and Hybrid RAG. 
-> **[📄 Read the Full Research Paper](./docs/Memoir-Ai-Research.pdf)**
+> **[📄 Read the Full Research Paper](./docs/AI_Based_Meeting_Bot_A_Cognitive_Intelligence_Solution_using_Sentiment_Analysis_&_Hybrid_RAG_Strategy_final.pdf)**
 
 ---
 
@@ -47,7 +47,7 @@ Memoir-Ai acts as an active participant. It uses a **Split-Brain Architecture** 
 
 Memoir-Ai utilizes a modern, event-driven architecture designed for high availability and low latency.
 
-![Detailed System Design](./public/images/meetingAI.svg)
+![Detailed System Design](./public/images/meetingAI%20System%20Architecture.svg)
 
 ### 1. The Autonomous Scheduler (AWS Lambda)
 * **Event Source:** Google Calendar Webhooks trigger synchronization events.
