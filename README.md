@@ -31,6 +31,14 @@
 | ![Sentiment Analysis](./public/images/Sentiment%20analysis.jpeg) | ![Chat with AI](./public/images/ChatwithAi.jpeg) |
 | *Real-time sentiment tracking per speaker to gauge meeting health.* | *Query your entire meeting history using Semantic Search.* |
 
+### **Automated Task Integration**
+
+| **JIRA** | **ASANA** | **TRELLO** |
+| :---: | :---: | :---: |
+| ![JIRA](./public/images/Integrations.jpeg) |
+| ![JIRA](./public/images/JIRA.jpeg) | ![ASANA](./public/images/Asana.jpeg) | ![TRELLO](./public/images/Trello.jpeg) |
+| *Sync tasks directly to Jira backlogs from meeting transcripts.* | *Automate workspace task creation via Asana integration.* | *Push action items to Trello boards with assigned owners.* |
+
 ---
 
 ## 🎯 Vision & Problem Statement
