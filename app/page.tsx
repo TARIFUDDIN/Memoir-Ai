@@ -23,3 +23,4 @@ export default function Home() {
     </div>
   );
 }
+//uv run uvicorn server:app --reload

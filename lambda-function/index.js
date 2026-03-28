@@ -1,5 +1,4 @@
 const { PrismaClient } = require("@prisma/client")
-
 const prisma = new PrismaClient()
 
 exports.handler = async (event) => {
@@ -160,7 +159,6 @@ async function processCalendarEvent(user, event) {
 async function scheduleBotsForUpcomingMeetings() {
     try {
         const now = new Date()
-        // LOOK AHEAD 20 MINUTES (Increased buffer)
         const checkWindow = new Date(now.getTime() + 20 * 60 * 1000)
 
         console.log(`🔍 [Schedule] Checking window: ${now.toISOString()} -> ${checkWindow.toISOString()}`)
@@ -197,18 +195,16 @@ async function scheduleBotsForUpcomingMeetings() {
             console.log(`✅ [Schedule] Deploying bot...`)
             const botResponse = await deployBotToMeeting(meeting, user)
 
-            // CRITICAL FIX: Log the entire response to debug
-            console.log("🔍 [DEBUG] Bot Response:", JSON.stringify(botResponse));
+            console.log("🔍 [DEBUG] Bot Response Summary:", JSON.stringify(botResponse));
 
             if (botResponse.success && botResponse.bot_id) {
                 console.log(`🎉 [Schedule] SUCCESS! Bot ID: ${botResponse.bot_id}`)
                 
-                // SAVE THE BOT ID TO DATABASE
                 await prisma.meeting.update({
                     where: { id: meeting.id },
                     data: { 
                         botSent: true, 
-                        botId: botResponse.bot_id, // This MUST be saved
+                        botId: botResponse.bot_id,
                         botJoinedAt: new Date() 
                     }
                 })
@@ -218,7 +214,7 @@ async function scheduleBotsForUpcomingMeetings() {
                     data: { meetingsThisMonth: { increment: 1 } }
                 })
             } else {
-                console.error(`💀 [Schedule] FAILED. ID Missing or Error: ${botResponse.error}`)
+                console.error(`💀 [Schedule] FAILED. Error: ${botResponse.error}`)
             }
         }
     } catch (error) {
@@ -253,19 +249,19 @@ async function deployBotToMeeting(meeting, user) {
         })
 
         const rawText = await response.text();
-        console.log("🔍 [DEBUG] Raw API Response:", rawText);
-
+        
         if (!response.ok) {
             return { success: false, error: `HTTP ${response.status}: ${rawText}` }
         }
 
         const json = JSON.parse(rawText);
         
-        // ✅ FIX: Check inside 'data' object correctly
-        const finalBotId = json.bot_id || (json.data && json.data.bot_id) || json.id;
+        // ✅ UPDATED EXTRACTION LOGIC
+        const finalBotId = json.bot_id || (json.data && json.data.bot_id);
 
         if (!finalBotId) {
-             return { success: false, error: "Bot ID not found in response" }
+             console.error("❌ [DEBUG] Failed to extract bot_id from:", json);
+             return { success: false, error: "Bot ID not found in response" };
         }
 
         return { success: true, bot_id: finalBotId }
