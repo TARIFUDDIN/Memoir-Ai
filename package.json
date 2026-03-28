@@ -37,6 +37,7 @@
     "clsx": "^2.1.1",
     "date-fns": "^4.1.0",
     "googleapis": "^166.0.0",
+    "groq-sdk": "^1.1.2",
     "langchain": "^1.1.2",
     "lucide-react": "^0.525.0",
     "neo4j-driver": "^6.0.1",
