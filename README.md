@@ -33,10 +33,10 @@
 
 ### **Automated Task Integration**
 
-| **JIRA** | **ASANA** | **TRELLO** |
+| :---: | :---: |
+| ![Action Items Generation](./public/images/Action%20items.jpg) | ![Action Items](./public/images/Integrations.jpeg) |
 | :---: | :---: | :---: |
-| ![Action Items Generation](./public/images/Action%20items.jpg) |
-| ![Action Items](./public/images/Integrations.jpeg) |
+| **JIRA** | **ASANA** | **TRELLO** |
 | ![JIRA](./public/images/JIRA.jpeg) | ![ASANA](./public/images/Asana.jpeg) | ![TRELLO](./public/images/Trello.jpeg) |
 | *Sync tasks directly to Jira backlogs from meeting transcripts.* | *Automate workspace task creation via Asana integration.* | *Push action items to Trello boards with assigned owners.* |
 
