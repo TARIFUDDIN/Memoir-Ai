@@ -210,9 +210,7 @@ function buildWordsFromText(text: string, startTime: number, endTime: number): T
   }))
 }
 
-/**
- * Simple fallback transcription
- */
+
 export async function transcribeAudioSimple(
   audioBuffer: Buffer,
   audioUrl: string = ""

@@ -63,7 +63,6 @@ function parseRawTranscriptArray(data: any[]): TranscriptSegment[] | null {
             || item.data
             || '';
         
-        // Debug: log what we found for first few segments
         if (i < 2) {
             console.log(`📋 [SEGMENT ${i}] Available fields:`, Object.keys(item));
             console.log(`📋 [SEGMENT ${i}] Text extracted as:`, text ? `"${text.substring(0, 100)}..."` : '(empty)');
