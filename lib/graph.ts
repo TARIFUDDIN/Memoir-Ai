@@ -1,13 +1,31 @@
+/**
+ * lib/graph.ts — Phase 3: Deep GraphRAG
+ *
+ * Changes from Phase 2:
+ * 3a. queryGraphMemory — replaced GraphCypherQAChain with intent-based explicit Cypher routing
+ * 3b. addToKnowledgeGraph — cross-meeting MERGE so shared entities (projects, topics, people)
+ *     become shared nodes across meetings instead of isolated per-meeting duplicates
+ * 3c. Co-reference resolution — fuzzy name merge via Groq before writing to Neo4j
+ */
+
 import { Neo4jGraph } from "@langchain/community/graphs/neo4j_graph"
-import { ChatOpenAI } from "@langchain/openai"
-import { GraphCypherQAChain } from "@langchain/community/chains/graph_qa/cypher"
+import Groq from "groq-sdk"
 import {
   enrichTranscript,
-  getDeduplicationMap,
+  normalizeName,
   type ExtractedEntity,
 } from "./entity-extractor"
 
-process.env.OPENAI_API_KEY = process.env.GROQ_API_KEY || "dummy"
+// ---------------------------------------------------------------------------
+// Groq client (replaces ChatOpenAI shim — used for intent detection + coref)
+// ---------------------------------------------------------------------------
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY! })
+const FAST_MODEL = "llama-3.1-8b-instant"
+const SMART_MODEL = "llama-3.3-70b-versatile"
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 type GraphNode = {
   type: string
@@ -29,24 +47,29 @@ type KnowledgeGraphData = {
   extractedAt: Date
 }
 
-// Query model — only used for querying, not extraction
-const queryModel = new ChatOpenAI({
-  modelName: "llama-3.1-8b-instant",
-  temperature: 0,
-  openAIApiKey: process.env.GROQ_API_KEY || "dummy",
-  configuration: {
-    baseURL: "https://api.groq.com/openai/v1",
-    apiKey: process.env.GROQ_API_KEY,
-  },
-  maxRetries: 2,
-})
+type QueryIntent =
+  | "PERSON"
+  | "PROJECT"
+  | "TOPIC"
+  | "ACTION_ITEM"
+  | "MEETING"
+  | "GENERAL"
+
+type IntentResult = {
+  intent: QueryIntent
+  entityName: string | null
+  normalizedId: string | null
+}
+
+// ---------------------------------------------------------------------------
+// Neo4j singleton
+// ---------------------------------------------------------------------------
 
 let graphInstance: Neo4jGraph | null = null
 
 async function getGraph(): Promise<Neo4jGraph> {
   if (graphInstance) return graphInstance
   const maxRetries = 3
-  const retryDelay = 2000
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       console.log(`🔗 Connecting to Neo4j (attempt ${attempt}/${maxRetries})...`)
@@ -58,23 +81,111 @@ async function getGraph(): Promise<Neo4jGraph> {
       console.log("✅ Neo4j connection established")
       return graphInstance
     } catch (error) {
-      console.error(`❌ Connection attempt ${attempt} failed:`, error instanceof Error ? error.message : error)
+      console.error(`❌ Neo4j attempt ${attempt} failed:`, error instanceof Error ? error.message : error)
       if (attempt < maxRetries) {
-        const waitTime = retryDelay * Math.pow(2, attempt - 1)
-        await new Promise((resolve) => setTimeout(resolve, waitTime))
+        await new Promise((r) => setTimeout(r, 2000 * Math.pow(2, attempt - 1)))
       }
     }
   }
   throw new Error("Failed to connect to Neo4j after retries")
 }
 
-/**
- * Build graph directly from extracted entities — NO LLM required
- */
+// ---------------------------------------------------------------------------
+// 3c. Co-reference resolution
+// "Bob", "Bob Smith", "Mr Smith" → same canonical node
+// ---------------------------------------------------------------------------
+
+async function resolveCoReferences(
+  entities: ExtractedEntity[]
+): Promise<ExtractedEntity[]> {
+  const people = entities.filter((e) => e.type === "PERSON")
+  if (people.length < 2) return entities
+
+  try {
+    const nameList = people.map((p) => p.value).join(", ")
+    const response = await groq.chat.completions.create({
+      model: FAST_MODEL,
+      temperature: 0,
+      max_tokens: 500,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `You are a co-reference resolution engine. Given a list of person names from a meeting transcript, identify which names refer to the same person.
+Return ONLY this JSON format — no explanation:
+{
+  "groups": [
+    { "canonical": "Full Name", "aliases": ["alias1", "alias2"] }
+  ]
+}
+Only include groups where 2+ names clearly refer to the same person. If all names are distinct people, return { "groups": [] }.`,
+        },
+        {
+          role: "user",
+          content: `Names from transcript: ${nameList}`,
+        },
+      ],
+    })
+
+    const content = response.choices[0]?.message?.content
+    if (!content) return entities
+
+    const parsed = JSON.parse(content.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim())
+    const groups: Array<{ canonical: string; aliases: string[] }> = parsed.groups ?? []
+
+    if (groups.length === 0) return entities
+
+    // Build alias → canonical map
+    const aliasToCanonical = new Map<string, string>()
+    for (const group of groups) {
+      const canonicalNorm = normalizeName(group.canonical)
+      for (const alias of group.aliases) {
+        aliasToCanonical.set(normalizeName(alias), canonicalNorm)
+        aliasToCanonical.set(alias.toLowerCase().trim(), canonicalNorm)
+      }
+    }
+
+    // Remap entities — merge aliases to canonical
+    const seen = new Set<string>()
+    const resolved: ExtractedEntity[] = []
+
+    for (const entity of entities) {
+      if (entity.type !== "PERSON") {
+        resolved.push(entity)
+        continue
+      }
+      const mapped = aliasToCanonical.get(entity.normalizedValue) ?? entity.normalizedValue
+      if (seen.has(mapped)) continue
+      seen.add(mapped)
+      resolved.push({ ...entity, normalizedValue: mapped })
+    }
+
+    // Also fix assignedTo in ACTION_ITEMs
+    return resolved.map((entity) => {
+      if (entity.type !== "ACTION_ITEM") return entity
+      const meta = entity.metadata as Record<string, unknown>
+      if (!meta.assignedTo) return entity
+      const remapped = aliasToCanonical.get(String(meta.assignedTo)) ?? String(meta.assignedTo)
+      return { ...entity, metadata: { ...meta, assignedTo: remapped } }
+    })
+  } catch (err) {
+    console.warn("⚠️ Co-reference resolution failed, proceeding without it:", err instanceof Error ? err.message : err)
+    return entities
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 3b. addToKnowledgeGraph — cross-meeting MERGE
+// Shared entities (Project, Topic, Speaker) use MERGE on normalizedValue only,
+// so the same entity appearing in multiple meetings shares one node.
+// Meeting-specific entities (ActionItem, Decision) MERGE on id+meetingId.
+// ---------------------------------------------------------------------------
+
 export async function addToKnowledgeGraph(
   transcript: unknown,
   meetingId: string,
-  meetingTitle: string
+  meetingTitle: string,
+  meetingStartTime?: Date
 ): Promise<KnowledgeGraphData | null> {
   try {
     if (!transcript) {
@@ -82,9 +193,9 @@ export async function addToKnowledgeGraph(
       return null
     }
 
-    console.log("🕸️ Starting Knowledge Graph Extraction (rule-based)...")
+    console.log("🕸️ Starting Knowledge Graph Extraction (Phase 3)...")
 
-    // Normalize transcript to text
+    // -- Normalize transcript to text --
     let textContent = ""
     if (Array.isArray(transcript)) {
       textContent = transcript
@@ -103,141 +214,182 @@ export async function addToKnowledgeGraph(
       textContent = String((transcript as Record<string, unknown>).text)
     }
 
-    if (!textContent || textContent.trim().length === 0) throw new Error("EMPTY_TRANSCRIPT_CONTENT")
+    if (!textContent.trim()) throw new Error("EMPTY_TRANSCRIPT_CONTENT")
 
-    // Extract entities using existing entity extractor
+    // -- Extract entities --
     const enrichmentResult = await enrichTranscript(textContent)
-    const entities = enrichmentResult.entities
+    let entities = enrichmentResult.entities
+    console.log(`✅ Extracted ${entities.length} raw entities`)
 
-    console.log(`✅ Extracted ${entities.length} entities`)
+    // 3c — resolve co-references before writing
+    entities = await resolveCoReferences(entities)
+    console.log(`✅ After co-reference resolution: ${entities.length} entities`)
 
-    // Build nodes and relationships directly from entities
     const nodes: GraphNode[] = []
     const relationships: GraphRelationship[] = []
 
-    // Add Meeting node
+    // -- Meeting node (always per-meeting) --
     nodes.push({
       type: "Meeting",
       id: meetingId,
-      properties: { title: meetingTitle, meetingId }
+      properties: {
+        id: meetingId,
+        title: meetingTitle,
+        meetingId,
+        startTime: meetingStartTime?.toISOString() ?? new Date().toISOString(),
+      },
     })
 
-    // Process each entity into nodes
+    // -- Process entities --
     for (const entity of entities) {
+
+      // PERSON — shared node, cross-meeting via MERGE on normalizedValue
       if (entity.type === "PERSON") {
         nodes.push({
           type: "Speaker",
           id: entity.normalizedValue,
-          properties: { name: entity.value, meetingId }
+          properties: { id: entity.normalizedValue, name: entity.value },
+          // NOTE: no meetingId on Speaker — intentionally shared
         })
         relationships.push({
           source: entity.normalizedValue,
           target: meetingId,
           type: "SPOKE_IN",
-          properties: { meetingId }
+          properties: { meetingId },
         })
       }
 
+      // ACTION_ITEM — scoped to meeting (unique per meeting)
       if (entity.type === "ACTION_ITEM") {
-        const metadata = entity.metadata as Record<string, unknown>
+        const actionId = `${meetingId}_${entity.normalizedValue}`
+        const meta = entity.metadata as Record<string, unknown>
         nodes.push({
           type: "ActionItem",
-          id: entity.normalizedValue,
-          properties: { text: entity.value, meetingId }
+          id: actionId,
+          properties: { id: actionId, text: entity.value, meetingId },
         })
-
+        // ActionItem → MENTIONED_IN → Meeting (cross-meeting tracking)
+        relationships.push({
+          source: actionId,
+          target: meetingId,
+          type: "MENTIONED_IN",
+          properties: { meetingId },
+        })
         // ActionItem → ASSIGNED_TO → Speaker
-        if (metadata.assignedTo) {
+        if (meta.assignedTo) {
           relationships.push({
-            source: entity.normalizedValue,
-            target: String(metadata.assignedTo),
+            source: actionId,
+            target: String(meta.assignedTo),
             type: "ASSIGNED_TO",
-            properties: { meetingId }
+            properties: { meetingId },
           })
         }
-
         // ActionItem → HAS_DEADLINE → Deadline
-        if (metadata.deadline) {
-          const deadlineId = `deadline_${String(metadata.deadline).replace(/-/g, "_")}`
+        if (meta.deadline) {
+          const deadlineId = `deadline_${String(meta.deadline).replace(/[^a-z0-9]/gi, "_")}`
           nodes.push({
             type: "Deadline",
             id: deadlineId,
-            properties: { date: metadata.deadline, meetingId }
+            properties: { id: deadlineId, date: meta.deadline },
           })
           relationships.push({
-            source: entity.normalizedValue,
+            source: actionId,
             target: deadlineId,
             type: "HAS_DEADLINE",
-            properties: { meetingId }
+            properties: { meetingId },
           })
         }
       }
 
+      // DECISION — scoped to meeting
       if (entity.type === "DECISION") {
+        const decisionId = `${meetingId}_${entity.normalizedValue}`
         nodes.push({
           type: "Decision",
-          id: entity.normalizedValue,
-          properties: { text: entity.value, meetingId }
+          id: decisionId,
+          properties: { id: decisionId, text: entity.value, meetingId },
         })
         relationships.push({
           source: meetingId,
-          target: entity.normalizedValue,
+          target: decisionId,
           type: "DECIDED_TO",
-          properties: { meetingId }
+          properties: { meetingId },
         })
       }
 
+      // PROJECT — shared node cross-meeting, MERGE on normalizedValue
       if (entity.type === "PROJECT") {
         nodes.push({
           type: "Project",
           id: entity.normalizedValue,
-          properties: { name: entity.value, meetingId }
+          properties: { id: entity.normalizedValue, name: entity.value },
+          // No meetingId — shared across meetings
+        })
+        // Project → MENTIONED_IN → Meeting
+        relationships.push({
+          source: entity.normalizedValue,
+          target: meetingId,
+          type: "MENTIONED_IN",
+          properties: { meetingId },
         })
       }
 
+      // TOPIC — shared node cross-meeting
       if (entity.type === "TOPIC") {
         nodes.push({
           type: "Topic",
           id: entity.normalizedValue,
-          properties: { name: entity.value, meetingId }
+          properties: { id: entity.normalizedValue, name: entity.value },
         })
         relationships.push({
           source: meetingId,
           target: entity.normalizedValue,
           type: "DISCUSSED",
-          properties: { meetingId }
+          properties: { meetingId },
         })
       }
     }
 
-    // Save to Neo4j using raw Cypher
+    // -- Write to Neo4j --
     const neo4j = await getGraph()
 
-    // Save nodes
     for (const node of nodes) {
       await neo4j.query(
-        `MERGE (n:${node.type} {id: $id})
-         SET n += $properties`,
+        `MERGE (n:${node.type} {id: $id}) SET n += $properties`,
         { id: node.id, properties: { ...node.properties, id: node.id } }
       )
     }
 
-    // Save relationships
     for (const rel of relationships) {
       await neo4j.query(
         `MATCH (a {id: $sourceId})
          MATCH (b {id: $targetId})
-         MERGE (a)-[r:${rel.type}]->(b)
+         MERGE (a)-[r:${rel.type} {meetingId: $meetingId}]->(b)
          SET r += $properties`,
         {
           sourceId: rel.source,
           targetId: rel.target,
-          properties: rel.properties || {}
+          meetingId: (rel.properties as Record<string, unknown>)?.meetingId ?? meetingId,
+          properties: rel.properties ?? {},
         }
       )
     }
 
-    console.log(`🕸️ Knowledge Graph Complete: ${nodes.length} nodes, ${relationships.length} relationships`)
+    // -- Cross-meeting CONTINUED_FROM links --
+    // Link this meeting to the most recent prior meeting that shares a Project or Topic
+    await neo4j.query(
+      `MATCH (curr:Meeting {id: $meetingId})
+       MATCH (prev:Meeting)
+       WHERE prev.id <> $meetingId
+         AND prev.startTime < curr.startTime
+       MATCH (curr)<-[:MENTIONED_IN]-(shared)
+       MATCH (shared)-[:MENTIONED_IN]->(prev)
+       WITH curr, prev ORDER BY prev.startTime DESC LIMIT 1
+       MERGE (curr)-[:CONTINUED_FROM]->(prev)`,
+      { meetingId }
+    )
+
+    console.log(`🕸️ Phase 3 Graph Complete: ${nodes.length} nodes, ${relationships.length} relationships`)
     return { nodes, relationships, meetingId, extractedAt: new Date() }
 
   } catch (error) {
@@ -246,34 +398,298 @@ export async function addToKnowledgeGraph(
   }
 }
 
+// ---------------------------------------------------------------------------
+// 3a. Intent detection — Groq SDK directly, no ChatOpenAI shim
+// ---------------------------------------------------------------------------
+
+async function detectIntent(question: string): Promise<IntentResult> {
+  try {
+    const response = await groq.chat.completions.create({
+      model: FAST_MODEL,
+      temperature: 0,
+      max_tokens: 150,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `Classify the intent of a question about meeting history.
+Return ONLY this JSON:
+{
+  "intent": "PERSON" | "PROJECT" | "TOPIC" | "ACTION_ITEM" | "MEETING" | "GENERAL",
+  "entityName": "the main entity name mentioned, or null"
+}
+
+Rules:
+- PERSON: asks about a specific person ("what did Alice work on", "Bob's tasks")
+- PROJECT: asks about a project ("Project Phoenix status", "what happened with the redesign")
+- TOPIC: asks about a topic/theme ("what was discussed about security", "authentication meetings")
+- ACTION_ITEM: asks about tasks/action items ("overdue tasks", "what actions are pending")
+- MEETING: asks about specific meetings by date/time ("last week's meetings", "yesterday's call")
+- GENERAL: anything else`,
+        },
+        { role: "user", content: question },
+      ],
+    })
+
+    const content = response.choices[0]?.message?.content
+    if (!content) return { intent: "GENERAL", entityName: null, normalizedId: null }
+
+    const parsed = JSON.parse(content.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim())
+    const entityName = parsed.entityName ?? null
+    return {
+      intent: (parsed.intent as QueryIntent) ?? "GENERAL",
+      entityName,
+      normalizedId: entityName ? normalizeName(String(entityName)) : null,
+    }
+  } catch {
+    return { intent: "GENERAL", entityName: null, normalizedId: null }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pre-written Cypher templates — one per intent
+// ---------------------------------------------------------------------------
+
+async function runPersonQuery(neo4j: Neo4jGraph, entityId: string): Promise<string> {
+  const result = await neo4j.query(
+    `MATCH (s:Speaker {id: $personId})
+     OPTIONAL MATCH (s)-[:SPOKE_IN]->(m:Meeting)
+     OPTIONAL MATCH (a:ActionItem)-[:ASSIGNED_TO]->(s)
+     OPTIONAL MATCH (a)-[:HAS_DEADLINE]->(d:Deadline)
+     RETURN
+       s.name AS person,
+       collect(DISTINCT m.title) AS meetings,
+       collect(DISTINCT { action: a.text, deadline: d.date }) AS actions`,
+    { personId: entityId }
+  ) as Array<Record<string, unknown>>
+
+  if (!result.length || !result[0].person) {
+    return `No information found for person "${entityId}".`
+  }
+
+  const row = result[0]
+  const meetings = (row.meetings as string[]).filter(Boolean)
+  const actions = (row.actions as Array<{ action: string; deadline: string }>)
+    .filter((a) => a.action)
+
+  let out = `**${row.person}** appeared in ${meetings.length} meeting(s): ${meetings.join(", ") || "none"}.`
+  if (actions.length) {
+    out += `\n\nAction items assigned:\n`
+    out += actions.map((a) => `- ${a.action}${a.deadline ? ` (due: ${a.deadline})` : ""}`).join("\n")
+  }
+  return out
+}
+
+async function runProjectQuery(neo4j: Neo4jGraph, entityId: string): Promise<string> {
+  const result = await neo4j.query(
+    `MATCH (p:Project {id: $projectId})
+     OPTIONAL MATCH (p)-[:MENTIONED_IN]->(m:Meeting)
+     OPTIONAL MATCH (m)-[:DECIDED_TO]->(dec:Decision)
+     RETURN p.name AS project,
+            collect(DISTINCT { title: m.title, time: m.startTime }) AS meetings,
+            collect(DISTINCT dec.text) AS decisions
+     ORDER BY m.startTime ASC`,
+    { projectId: entityId }
+  ) as Array<Record<string, unknown>>
+
+  if (!result.length || !result[0].project) {
+    return `No information found for project "${entityId}".`
+  }
+
+  const row = result[0]
+  const meetings = (row.meetings as Array<{ title: string; time: string }>).filter((m) => m.title)
+  const decisions = (row.decisions as string[]).filter(Boolean)
+
+  let out = `**${row.project}** was discussed in ${meetings.length} meeting(s):\n`
+  out += meetings.map((m) => `- ${m.title}${m.time ? ` (${m.time.substring(0, 10)})` : ""}`).join("\n")
+  if (decisions.length) {
+    out += `\n\nDecisions made:\n`
+    out += decisions.map((d) => `- ${d}`).join("\n")
+  }
+  return out
+}
+
+async function runTopicQuery(neo4j: Neo4jGraph, entityId: string): Promise<string> {
+  const result = await neo4j.query(
+    `MATCH (t:Topic {id: $topicId})<-[:DISCUSSED]-(m:Meeting)
+     RETURN t.name AS topic,
+            collect({ title: m.title, time: m.startTime }) AS meetings
+     ORDER BY m.startTime DESC`,
+    { topicId: entityId }
+  ) as Array<Record<string, unknown>>
+
+  if (!result.length || !result[0].topic) {
+    return `No information found for topic "${entityId}".`
+  }
+
+  const row = result[0]
+  const meetings = (row.meetings as Array<{ title: string; time: string }>).filter((m) => m.title)
+
+  let out = `**${row.topic}** was discussed in ${meetings.length} meeting(s):\n`
+  out += meetings.map((m) => `- ${m.title}${m.time ? ` (${m.time.substring(0, 10)})` : ""}`).join("\n")
+  return out
+}
+
+async function runActionItemQuery(neo4j: Neo4jGraph): Promise<string> {
+  const result = await neo4j.query(
+    `MATCH (a:ActionItem)
+     OPTIONAL MATCH (a)-[:ASSIGNED_TO]->(s:Speaker)
+     OPTIONAL MATCH (a)-[:HAS_DEADLINE]->(d:Deadline)
+     OPTIONAL MATCH (a)-[:MENTIONED_IN]->(m:Meeting)
+     RETURN a.text AS action,
+            s.name AS assignee,
+            d.date AS deadline,
+            collect(DISTINCT m.title) AS meetings
+     ORDER BY d.date ASC
+     LIMIT 20`
+  ) as Array<Record<string, unknown>>
+
+  if (!result.length) return "No action items found."
+
+  return result
+    .map((row) => {
+      let line = `- **${row.action}**`
+      if (row.assignee) line += ` → ${row.assignee}`
+      if (row.deadline) line += ` (due: ${row.deadline})`
+      return line
+    })
+    .join("\n")
+}
+
+async function runMeetingQuery(neo4j: Neo4jGraph, question: string): Promise<string> {
+  // Extract rough date range from question via Groq
+  let dateFilter = ""
+  try {
+    const dateResp = await groq.chat.completions.create({
+      model: FAST_MODEL,
+      temperature: 0,
+      max_tokens: 80,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `Extract a date range from the question. Today is ${new Date().toISOString().split("T")[0]}.
+Return ONLY: { "from": "YYYY-MM-DD or null", "to": "YYYY-MM-DD or null" }`,
+        },
+        { role: "user", content: question },
+      ],
+    })
+    const parsed = JSON.parse(dateResp.choices[0]?.message?.content ?? "{}")
+    if (parsed.from) dateFilter = `WHERE m.startTime >= datetime('${parsed.from}T00:00:00')`
+    if (parsed.to) dateFilter += ` ${dateFilter ? "AND" : "WHERE"} m.startTime <= datetime('${parsed.to}T23:59:59')`
+  } catch { /* ignore, run without date filter */ }
+
+  const result = await neo4j.query(
+    `MATCH (m:Meeting)
+     ${dateFilter}
+     OPTIONAL MATCH (s:Speaker)-[:SPOKE_IN]->(m)
+     OPTIONAL MATCH (m)-[:DECIDED_TO]->(dec:Decision)
+     RETURN m.title AS title,
+            m.startTime AS startTime,
+            collect(DISTINCT s.name) AS speakers,
+            collect(DISTINCT dec.text) AS decisions
+     ORDER BY m.startTime DESC
+     LIMIT 10`
+  ) as Array<Record<string, unknown>>
+
+  if (!result.length) return "No meetings found for that time range."
+
+  return result
+    .map((row) => {
+      const date = row.startTime ? String(row.startTime).substring(0, 10) : "unknown date"
+      const speakers = (row.speakers as string[]).filter(Boolean).join(", ")
+      const decisions = (row.decisions as string[]).filter(Boolean)
+      let out = `**${row.title}** (${date})${speakers ? ` — ${speakers}` : ""}`
+      if (decisions.length) out += `\n  Decisions: ${decisions.join("; ")}`
+      return out
+    })
+    .join("\n\n")
+}
+
+async function runGeneralQuery(neo4j: Neo4jGraph, question: string): Promise<string> {
+  // Fallback: use Groq to answer from graph stats + recent activity
+  const stats = await neo4j.query(
+    `MATCH (m:Meeting)
+     OPTIONAL MATCH (a:ActionItem)-[:MENTIONED_IN]->(m)
+     OPTIONAL MATCH (s:Speaker)-[:SPOKE_IN]->(m)
+     RETURN m.title AS title, m.startTime AS time,
+            count(DISTINCT a) AS actionCount,
+            count(DISTINCT s) AS speakerCount
+     ORDER BY m.startTime DESC LIMIT 5`
+  ) as Array<Record<string, unknown>>
+
+  const context = stats
+    .map((r) => `Meeting: ${r.title}, speakers: ${r.speakerCount}, actions: ${r.actionCount}`)
+    .join("\n")
+
+  try {
+    const response = await groq.chat.completions.create({
+      model: SMART_MODEL,
+      temperature: 0.2,
+      max_tokens: 400,
+      messages: [
+        {
+          role: "system",
+          content: "You answer questions about meeting history based on provided graph data. Be concise.",
+        },
+        {
+          role: "user",
+          content: `Graph data:\n${context}\n\nQuestion: ${question}`,
+        },
+      ],
+    })
+    return response.choices[0]?.message?.content ?? "Unable to generate response."
+  } catch {
+    return context || "No meeting data available."
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 3a. queryGraphMemory — intent router (replaces GraphCypherQAChain)
+// ---------------------------------------------------------------------------
+
 export async function queryGraphMemory(question: string): Promise<string> {
   try {
     if (!question?.trim()) return "Error: Please provide a valid question."
 
     console.log(`🔍 Graph Query: "${question}"`)
-    const neo4jGraph = await getGraph()
+    const neo4j = await getGraph()
 
-    const chain = GraphCypherQAChain.fromLLM({
-      llm: queryModel,
-      graph: neo4jGraph,
-    })
+    const { intent, entityName, normalizedId } = await detectIntent(question)
+    console.log(`🎯 Intent: ${intent}, Entity: ${entityName} (${normalizedId})`)
 
-    const response = await chain.invoke({ query: question })
-    console.log("✅ Graph Query Complete")
+    switch (intent) {
+      case "PERSON":
+        if (!normalizedId) return "Could not identify a person name in your question."
+        return await runPersonQuery(neo4j, normalizedId)
 
-    if (response && typeof response === "object") {
-      const r = response as Record<string, unknown>
-      if ("text" in r && typeof r.text === "string") return r.text
-      if ("output" in r) return String(r.output)
-      if ("result" in r) return String(r.result)
+      case "PROJECT":
+        if (!normalizedId) return "Could not identify a project name in your question."
+        return await runProjectQuery(neo4j, normalizedId)
+
+      case "TOPIC":
+        if (!normalizedId) return "Could not identify a topic in your question."
+        return await runTopicQuery(neo4j, normalizedId)
+
+      case "ACTION_ITEM":
+        return await runActionItemQuery(neo4j)
+
+      case "MEETING":
+        return await runMeetingQuery(neo4j, question)
+
+      case "GENERAL":
+      default:
+        return await runGeneralQuery(neo4j, question)
     }
-
-    return typeof response === "string" ? response : JSON.stringify(response)
   } catch (error) {
     console.error("❌ Graph Query Failed:", error instanceof Error ? error.message : error)
     return ""
   }
 }
+
+// ---------------------------------------------------------------------------
+// Unchanged utility exports
+// ---------------------------------------------------------------------------
 
 export async function clearGraph(): Promise<boolean> {
   try {
@@ -290,12 +706,21 @@ export async function clearGraph(): Promise<boolean> {
 export async function deleteGraphForMeeting(meetingId: string): Promise<boolean> {
   try {
     const neo4jGraph = await getGraph()
-    const result = await neo4jGraph.query(
-      `MATCH (n {meetingId: $meetingId}) DETACH DELETE n RETURN count(n) as deletedCount`,
+    // Only delete meeting-scoped nodes; shared nodes (Speaker, Project, Topic) are preserved
+    await neo4jGraph.query(
+      `MATCH (n)
+       WHERE n.meetingId = $meetingId
+         AND NOT n:Speaker AND NOT n:Project AND NOT n:Topic
+       DETACH DELETE n`,
       { meetingId }
     )
-    const deletedCount = (result as Array<Record<string, unknown>>)[0]?.deletedCount ?? 0
-    console.log(`🧹 Deleted ${deletedCount} nodes for meeting ${meetingId}`)
+    // Remove this meeting's relationships from shared nodes
+    await neo4jGraph.query(
+      `MATCH ()-[r {meetingId: $meetingId}]->()
+       DELETE r`,
+      { meetingId }
+    )
+    console.log(`🧹 Deleted meeting-scoped data for ${meetingId}`)
     return true
   } catch (error) {
     console.error(`Failed to delete graph for meeting ${meetingId}:`, error)
