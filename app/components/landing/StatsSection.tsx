@@ -1,6 +1,7 @@
 import React from 'react'
 
-function StatsSection() {
+function StatsSection ()
+{
     return (
 
         <section className='py-20 bg-black'>

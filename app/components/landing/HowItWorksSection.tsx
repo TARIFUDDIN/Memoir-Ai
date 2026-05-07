@@ -1,12 +1,13 @@
 import React from 'react'
 
-function HowItWorksSection() {
+function HowItWorksSection ()
+{
     return (
         <section className='py-20 bg-black'>
             <div className='max-w-6xl mx-auto px-4'>
                 <div className='text-center mb-16'>
                     <h2 className='text-3xl md:text-4xl font-bold text-white mb-4'>
-                        How It {' '}
+                        How It { ' ' }
                         <span className="bg-gradient-to-r from-blue-400 via-blue-500 to-blue-600  bg-clip-text text-transparent">
                             Works
                         </span>

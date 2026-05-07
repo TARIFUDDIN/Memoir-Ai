@@ -1,7 +1,8 @@
 import { Bot } from 'lucide-react'
 import React from 'react'
 
-function Footer() {
+function Footer ()
+{
     return (
         <footer className='border-t border-gray-800 py-5 bg-black'>
             <div className='max-w-6xl mx-auto px-4'>
@@ -10,10 +11,10 @@ function Footer() {
                         <div className='w-8 h-8 bg-gray-800 rounded-lg flex items-center justify-center'>
                             <Bot className='w-5 h-5 text-gray-300' />
                         </div>
-                        <span className='text-xl font-bold text-white'>MeetingBot</span>
+                        <span className='text-xl font-bold text-white'>Meetings AI</span>
                     </div>
                     <div className='text-gray-500 text-sm'>
-                        &copy; {new Date().getFullYear()} MeetingBot. Made with ❤️ for better meetings.
+                        &copy; { new Date().getFullYear() } Meetings AI. Made with ❤️ for better meetings.
                     </div>
                 </div>
             </div>

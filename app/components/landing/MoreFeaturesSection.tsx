@@ -1,13 +1,14 @@
 import { Download, Settings } from 'lucide-react'
 import React from 'react'
 
-function MoreFeaturesSection() {
+function MoreFeaturesSection ()
+{
     return (
         <section className='py-10 bg-black'>
             <div className='max-w-6xl mx-auto px-4'>
                 <div className='text-center mb-12'>
                     <h2 className='text-3xl md:text-4xl font-bold text-white mb-4'>
-                        Plus{' '}
+                        Plus{ ' ' }
                         <span className="bg-gradient-to-r from-blue-400 via-blue-500 to-blue-600  bg-clip-text text-transparent">
                             More Features
                         </span>

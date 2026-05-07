@@ -23,7 +23,7 @@ export async function POST(request: NextRequest) {
             },
             select: {
                 ragProcessed: true,
-                userId: true
+                createdById: true
             }
         })
 
@@ -31,7 +31,7 @@ export async function POST(request: NextRequest) {
             return NextResponse.json({ error: 'Meeting not found' }, { status: 404 })
         }
 
-        if (meeting.userId !== userId) {
+        if (meeting.createdById !== userId) {
             return NextResponse.json({ error: 'Unauthorized' }, { status: 403 })
         }
 

@@ -8,7 +8,8 @@ import MoreFeaturesSection from "./components/landing/MoreFeaturesSection";
 import CTASection from "./components/landing/CTASection";
 import Footer from "./components/landing/Footer";
 
-export default function Home() {
+export default function Home ()
+{
   return (
 
     <div className="min-h-screen bg-black">
@@ -23,4 +24,3 @@ export default function Home() {
     </div>
   );
 }
-//uv run uvicorn server:app --reload

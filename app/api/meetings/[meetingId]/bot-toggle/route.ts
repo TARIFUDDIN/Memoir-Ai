@@ -3,83 +3,210 @@ import { auth } from "@clerk/nextjs/server";
 import { NextResponse } from "next/server";
 
 export async function POST(
-    request: Request,
-    { params }: { params: Promise<{ meetingId: string }> }
+  request: Request,
+  { params }: { params: Promise<{ meetingId: string }> }
 ) {
-    try {
-        const { userId } = await auth()
-        if (!userId) return NextResponse.json({ error: "Not authenticated" }, { status: 401 })
+  try {
+    const { meetingId } = await params;
+    const { botScheduled } = await request.json();
 
-        const { meetingId } = await params
-        const { botScheduled } = await request.json()
+    // ✅ Detect server calls (QStash / cron)
+    const isServerCall = request.headers.get("upstash-signature");
 
-        const user = await prisma.user.findUnique({
-            where: { clerkId: userId }
-        })
+    let user: any = null;
+    let meeting:
+      | Awaited<ReturnType<typeof prisma.meeting.findUnique>>
+      | null = null;
 
-        if (!user) return NextResponse.json({ error: "User not found" }, { status: 404 })
+    // =========================
+    // ✅ USER FLOW (Frontend)
+    // =========================
+    if (!isServerCall) {
+      const { userId } = await auth();
 
-        const meeting = await prisma.meeting.findUnique({
-            where: {
-                id: meetingId,
-                createdById: user.id // ✅ Changed
-            }
-        })
+      if (!userId) {
+        return NextResponse.json(
+          { error: "Not authenticated" },
+          { status: 401 }
+        );
+      }
 
-        if (!meeting) return NextResponse.json({ error: "Meeting not found" }, { status: 404 })
+      user = await prisma.user.findUnique({
+        where: { clerkId: userId },
+      });
 
-        await prisma.meeting.update({
-            where: { id: meetingId },
-            data: { botScheduled }
-        })
+      if (!user) {
+        return NextResponse.json(
+          { error: "User not found" },
+          { status: 404 }
+        );
+      }
 
-        if (botScheduled) {
-            if (!meeting.meetingUrl) {
-                return NextResponse.json({ error: "No meeting URL" }, { status: 400 })
-            }
+      meeting = await prisma.meeting.findUnique({
+        where: {
+          id: meetingId,
+          createdById: user.id,
+        },
+      });
 
-            const webhookUrl = `${process.env.NEXT_PUBLIC_APP_URI}/api/webhooks/meetingbaas`
-            const apiKey = process.env.MEETING_BAAS_API_KEY
+      if (!meeting) {
+        return NextResponse.json(
+          { error: "Meeting not found" },
+          { status: 404 }
+        );
+      }
 
-            try {
-                const response = await fetch("https://api.meetingbaas.com/bots", {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "x-meeting-baas-api-key": apiKey!,
-                    },
-                    body: JSON.stringify({
-                        meeting_url: meeting.meetingUrl,
-                        bot_name: "MeetingBot",
-                        recording_mode: "speaker_view",
-                        // ✅ Fix: botImageUrl might not exist on User schema anymore?
-                        // Use user.image or a default
-                        bot_image: user.image || "https://i.pravatar.cc/150?u=MeetingBot", 
-                        entry_message: "Hi, I'm recording this meeting.",
-                        webhook_url: webhookUrl,
-                    }),
-                })
+      // ✅ Update toggle
+      await prisma.meeting.update({
+        where: { id: meetingId },
+        data: { botScheduled },
+      });
 
-                if (!response.ok) throw new Error("Bot API failed")
-                const botData = await response.json()
-
-                await prisma.meeting.update({
-                    where: { id: meetingId },
-                    data: {
-                        botId: botData.bot_id,
-                        botSent: true,
-                        botJoinedAt: new Date()
-                    }
-                })
-
-            } catch (error) {
-                return NextResponse.json({ error: "Failed to spawn bot" }, { status: 500 })
-            }
-        }
-
-        return NextResponse.json({ success: true, botScheduled })
-
-    } catch (error) {
-        return NextResponse.json({ error: "Failed" }, { status: 500 })
+      // ❌ If disabled → exit early
+      if (!botScheduled) {
+        return NextResponse.json({
+          success: true,
+          botScheduled: false,
+        });
+      }
     }
+
+    // =========================
+    // ✅ SERVER FLOW (QStash)
+    // =========================
+    if (isServerCall) {
+      meeting = await prisma.meeting.findUnique({
+        where: { id: meetingId },
+       include: { createdBy: true }, 
+      });
+
+      if (!meeting) {
+        return NextResponse.json(
+          { error: "Meeting not found" },
+          { status: 404 }
+        );
+      }
+
+      // Respect manual disable
+      if (!meeting.botScheduled) {
+        return NextResponse.json({
+          success: true,
+          skipped: true,
+        });
+      }
+
+      user = meeting.createdById
+
+    }
+
+    // =========================
+    // ✅ FINAL SAFETY CHECK (fix TS error)
+    // =========================
+    if (!meeting) {
+      return NextResponse.json(
+        { error: "Meeting not found" },
+        { status: 404 }
+      );
+    }
+
+    // =========================
+    // ✅ COMMON LOGIC
+    // =========================
+
+    if (!meeting.meetingUrl) {
+      return NextResponse.json(
+        { error: "No meeting URL" },
+        { status: 400 }
+      );
+    }
+
+    // ❌ Prevent duplicate bot
+    if (meeting.botSent) {
+      return NextResponse.json({
+        success: true,
+        alreadySent: true,
+      });
+    }
+
+    const apiKey = process.env.MEETING_BAAS_API_KEY;
+    const webhookUrl =
+      process.env.WEBHOOK_URL ||
+      `${process.env.NEXT_PUBLIC_APP_URI}/api/webhooks/meetingbaas`;
+
+    if (!apiKey) {
+      return NextResponse.json(
+        { error: "Missing MEETING_BAAS_API_KEY" },
+        { status: 500 }
+      );
+    }
+
+    if (!webhookUrl) {
+      return NextResponse.json(
+        { error: "Missing WEBHOOK_URL" },
+        { status: 500 }
+      );
+    }
+
+    console.log("🚀 Sending bot...");
+    console.log("Meeting URL:", meeting.meetingUrl);
+    console.log("Webhook URL:", webhookUrl);
+
+    // =========================
+    // ✅ CALL MEETING BAAS (v1)
+    // =========================
+    const response = await fetch("https://api.meetingbaas.com/bots", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-meeting-baas-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        meeting_url: meeting.meetingUrl,
+        bot_name: user?.botName || "MeetingBot",
+        recording_mode: "speaker_view",
+        bot_image:
+          user?.image || "https://i.pravatar.cc/150?u=MeetingBot",
+        entry_message: "Hi, I'm recording this meeting.",
+        webhook_url: webhookUrl,
+      }),
+    });
+
+    const raw = await response.text();
+
+    if (!response.ok) {
+      console.error("❌ MeetingBaaS ERROR:", raw);
+      return NextResponse.json(
+        { error: raw },
+        { status: 500 }
+      );
+    }
+
+    const botData = JSON.parse(raw);
+
+    // =========================
+    // ✅ SAVE BOT DATA
+    // =========================
+    await prisma.meeting.update({
+      where: { id: meetingId },
+      data: {
+        botId: botData.bot_id,
+        botSent: true,
+        botJoinedAt: new Date(),
+      },
+    });
+
+    console.log("🤖 Bot sent successfully:", botData.bot_id);
+
+    return NextResponse.json({
+      success: true,
+      botScheduled: true,
+    });
+
+  } catch (error) {
+    console.error("🔥 bot-toggle error:", error);
+    return NextResponse.json(
+      { error: "Internal Server Error" },
+      { status: 500 }
+    );
+  }
 }

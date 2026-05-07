@@ -1,154 +1,481 @@
-import { prisma } from "./db";
-import { chatWithAI, createEmbedding, createManyEmbeddings } from "./openai";
-import { saveManyVectors, searchVectors } from "./pinecone";
-import { chunkTranscript, extractSpeaker } from "./text-chunker";
-import { queryGraphMemory } from "./graph"; 
+/**
+ * rag.ts — Hybrid RAG pipeline
+ *
+ * PHASE 1: BM25 + Cohere reranker + multi-query retrieval
+ * PHASE 2: Parent-child chunking + context compression + Redis cache
+ *
+ * chatWithMeeting     — single-meeting scoped Q&A
+ * chatWithAllMeetings — global hybrid search (fully upgraded)
+ */
+
+import { prisma } from "./db"
+import { chatWithAI, createEmbedding, createManyEmbeddings } from "./openai"
+import { saveManyVectors, searchVectors } from "./pinecone"
+import { chunkTranscriptParentChild, chunkTranscript, extractSpeaker } from "./text-chunker"
+import { queryGraphMemory } from "./graph"
+import { BM25Index, type BM25Document } from "./bm25"
+import { cohereRerank, type CandidateDoc } from "./reranker"
+import { compressChunks } from "./compressor"
+import { getCachedResponse, setCachedResponse } from "./cache"
+import Groq from "groq-sdk"
+
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY! })
+
+// ─────────────────────────────────────────────
+// CONSTANTS
+// ─────────────────────────────────────────────
+
+const VECTOR_TOP_K  = 12   // fetch more than needed before rerank
+const BM25_TOP_K    = 12
+const RERANK_TOP_N  = 6    // final docs fed to LLM
+const MULTI_QUERY_N = 3    // query variants to generate
+
+// ─────────────────────────────────────────────
+// INGEST  — Phase 2: parent-child chunking
+// ─────────────────────────────────────────────
+
 export async function processTranscript(
-    meetingId: string,
-    userId: string,
-    transcript: string,
-    meetingTitle?: string
+  meetingId: string,
+  userId: string,
+  transcript: string,
+  meetingTitle?: string
 ) {
-    const chunks = chunkTranscript(transcript)
-    const texts = chunks.map(chunk => chunk.content)
+  // Use new parent-child chunker
+  const childChunks = chunkTranscriptParentChild(transcript)
+
+  if (childChunks.length === 0) {
+    // Fallback to legacy chunker if transcript is too short to split
+    const legacyChunks = chunkTranscript(transcript)
+    const texts = legacyChunks.map(c => c.content)
     const embeddings = await createManyEmbeddings(texts)
 
-    const dbChunks = chunks.map((chunk) => ({
-        meetingId,
-        chunkIndex: chunk.chunkIndex,
-        content: chunk.content,
-        speakerName: extractSpeaker(chunk.content),
-        vectorId: `${meetingId}_chunk_${chunk.chunkIndex}`
-    }))
-
     await prisma.transcriptChunk.createMany({
-        data: dbChunks,
-        skipDuplicates: true
+      data: legacyChunks.map(c => ({
+        meetingId,
+        chunkIndex: c.chunkIndex,
+        content: c.content,
+        speakerName: extractSpeaker(c.content),
+        vectorId: `${meetingId}_chunk_${c.chunkIndex}`,
+        isChildChunk: false,
+      })),
+      skipDuplicates: true,
     })
 
-    const vectors = chunks.map((chunk, index) => ({
-        id: `${meetingId}_chunk_${chunk.chunkIndex}`,
-        embedding: embeddings[index],
+    await saveManyVectors(
+      legacyChunks.map((c, i) => ({
+        id: `${meetingId}_chunk_${c.chunkIndex}`,
+        embedding: embeddings[i],
         metadata: {
-            meetingId,
-            userId,
-            chunkIndex: chunk.chunkIndex,
-            content: chunk.content,
-            speakerName: extractSpeaker(chunk.content),
-            meetingTitle: meetingTitle || 'Untitled Meeting'
-        }
-    }))
+          meetingId,
+          userId,
+          chunkIndex: c.chunkIndex,
+          content: c.content,
+          speakerName: extractSpeaker(c.content),
+          meetingTitle: meetingTitle ?? "Untitled Meeting",
+          hasParent: false,
+        },
+      }))
+    )
+    return
+  }
 
-    await saveManyVectors(vectors)
+  // Embed only the small child contents → Pinecone gets precise chunks
+  const texts = childChunks.map(c => c.content)
+  const embeddings = await createManyEmbeddings(texts)
+
+  // Store child chunks in DB — parentContent lives here, NOT in Pinecone
+  // (Pinecone metadata has a 40KB limit per vector; parent text can exceed that)
+  await prisma.transcriptChunk.createMany({
+    data: childChunks.map(c => ({
+      meetingId,
+      chunkIndex: c.chunkIndex,
+      content: c.content,
+      speakerName: extractSpeaker(c.content),
+      vectorId: `${meetingId}_chunk_${c.chunkIndex}`,
+      parentContent: c.parentContent,
+      parentChunkId: c.parentChunkId,
+      isChildChunk: true,
+    })),
+    skipDuplicates: true,
+  })
+
+  // Pinecone vectors: embed child content, store parentChunkId in metadata
+  // so we can fetch the parent from DB at query time
+  await saveManyVectors(
+    childChunks.map((c, i) => ({
+      id: `${meetingId}_chunk_${c.chunkIndex}`,
+      embedding: embeddings[i],
+      metadata: {
+        meetingId,
+        userId,
+        chunkIndex: c.chunkIndex,
+        content: c.content,           // child — for BM25 matching
+        speakerName: extractSpeaker(c.content),
+        meetingTitle: meetingTitle ?? "Untitled Meeting",
+        parentChunkId: c.parentChunkId,
+        hasParent: true,
+      },
+    }))
+  )
 }
+
+// ─────────────────────────────────────────────
+// SINGLE-MEETING CHAT  (no change to interface)
+// ─────────────────────────────────────────────
 
 export async function chatWithMeeting(
-    userId: string,
-    meetingId: string,
-    question: string
+  userId: string,
+  meetingId: string,
+  question: string
 ) {
-    const questionEmbedding = await createEmbedding(question)
+  const questionEmbedding = await createEmbedding(question)
 
-    const results = await searchVectors(
-        questionEmbedding,
-        { userId, meetingId },
-        5
-    )
+  const results = await searchVectors(
+    questionEmbedding,
+    { userId, meetingId },
+    5
+  )
 
-    const meeting = await prisma.meeting.findUnique({
-        where: { id: meetingId }
-    })
+  const meeting = await prisma.meeting.findUnique({ where: { id: meetingId } })
 
-    const context = results
-        .map(result => {
-            const speaker = result.metadata?.speakerName || 'Unknown'
-            const content = result.metadata?.content || ''
-            return `${speaker}: ${content}`
-        })
-        .join('\n\n')
+  const context = results
+    .map(r => `${r.metadata?.speakerName || "Unknown"}: ${r.metadata?.content || ""}`)
+    .join("\n\n")
 
-    const systemPrompt = `You are helping someone understand their meeting.
-    Meeting: ${meeting?.title || 'Untitled Meeting'}
-    Date: ${meeting?.createdAt ? new Date(meeting.createdAt).toDateString() : 'Unknown'}
+  const systemPrompt = `You are helping someone understand their meeting.
+Meeting: ${meeting?.title || "Untitled Meeting"}
+Date: ${meeting?.createdAt ? new Date(meeting.createdAt).toDateString() : "Unknown"}
 
-    Here's what was discussed:
-    ${context}
+Here's what was discussed:
+${context}
 
-    Answer the user's question based only on the meeting content above. If the answer isn't in the meeting, say so`
+Answer the user's question based only on the meeting content above. If the answer isn't in the meeting, say so.`
 
-    const answer = await chatWithAI(systemPrompt, question)
+  const answer = await chatWithAI(systemPrompt, question)
 
-    return {
-        answer,
-        sources: results.map(result => ({
-            meetingId: result.metadata?.meetingId,
-            content: result.metadata?.content,
-            speakerName: result.metadata?.speakerName,
-            confidence: result.score
-        }))
-    }
+  return {
+    answer,
+    sources: results.map(r => ({
+      meetingId: r.metadata?.meetingId,
+      content: r.metadata?.content,
+      speakerName: r.metadata?.speakerName,
+      confidence: r.score,
+    })),
+  }
 }
 
-// ---------------------------------------------------------
-// 🧠 UPGRADED: HYBRID GLOBAL SEARCH (Graph + Vector)
-// ---------------------------------------------------------
-export async function chatWithAllMeetings(
-    userId: string,
-    question: string
-) {
-    // 1. Parallel Execution: Run Vector Search AND Graph Search at the same time
-    const [questionEmbedding, graphKnowledge] = await Promise.all([
-        createEmbedding(question),
-        queryGraphMemory(question) // Query Neo4j
-    ]);
+// ─────────────────────────────────────────────
+// STEP 1: MULTI-QUERY EXPANSION
+// ─────────────────────────────────────────────
 
-    // 2. Vector Search Results (Unstructured Text)
-    const vectorResults = await searchVectors(
-        questionEmbedding,
-        { userId },
-        8
+async function expandQuery(question: string): Promise<string[]> {
+  try {
+    const response = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      temperature: 0.6,
+      max_tokens: 300,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `Generate ${MULTI_QUERY_N} distinct rephrasings of the user's question.
+Each rephrasing should approach the same information need from a different angle.
+Return ONLY valid JSON: { "queries": ["query1", "query2", "query3"] }`,
+        },
+        { role: "user", content: question },
+      ],
+    })
+
+    const raw = response.choices[0]?.message?.content || "{}"
+    const parsed = JSON.parse(raw) as { queries?: string[] }
+    const variants = parsed.queries ?? []
+
+    // Always include the original
+    return [question, ...variants].slice(0, MULTI_QUERY_N + 1)
+  } catch (err) {
+    console.warn("⚠️ Multi-query expansion failed, using original:", err)
+    return [question]
+  }
+}
+
+// ─────────────────────────────────────────────
+// STEP 2: VECTOR SEARCH ACROSS ALL QUERY VARIANTS
+// ─────────────────────────────────────────────
+
+async function multiQueryVectorSearch(
+  queries: string[],
+  userId: string
+): Promise<CandidateDoc[]> {
+  // Embed all queries in one Cohere call
+  const embeddings = await createManyEmbeddings(queries)
+
+  // Run Pinecone searches in parallel
+  const searchResults = await Promise.all(
+    embeddings.map(embedding =>
+      searchVectors(embedding, { userId }, VECTOR_TOP_K)
     )
+  )
 
-    const vectorContext = vectorResults
-        .map(result => {
-            const meetingTitle = result.metadata?.meetingTitle || 'Untitled Meeting'
-            const speaker = result.metadata?.speakerName || 'Unknown'
-            const content = result.metadata?.content || ''
-            return `[Meeting: ${meetingTitle}] ${speaker}: ${content}`
+  // Flatten + deduplicate by vectorId, keep highest score per doc
+  const seen = new Map<string, CandidateDoc>()
+
+  for (const results of searchResults) {
+    for (const r of results) {
+      const id = String(r.id ?? r.metadata?.vectorId ?? "")
+      const existing = seen.get(id)
+      const score = r.score ?? 0
+
+      if (!existing || score > (existing.score ?? 0)) {
+        seen.set(id, {
+          id,
+          content: String(r.metadata?.content ?? ""),
+          metadata: r.metadata as Record<string, unknown>,
+          score,
+          source: "vector",
         })
-        .join('\n\n')
-
-    // 3. Construct the "Super Context"
-    const systemPrompt = `You are an advanced AI assistant with access to the user's corporate memory.
-    
-    You have two sources of information:
-    
-    --- SOURCE 1: KNOWLEDGE GRAPH (Structured Facts) ---
-    ${graphKnowledge ? graphKnowledge : "No direct relationships found in the graph."}
-    
-    --- SOURCE 2: TRANSCRIPT FRAGMENTS (Discussion Context) ---
-    ${vectorContext}
-
-    INSTRUCTIONS:
-    1. Use the "Knowledge Graph" to identify specific entities, roles, and relationships (e.g. who manages whom, who owns what project).
-    2. Use the "Transcripts" to understand the nuance, context, and discussions around those entities.
-    3. Synthesize both sources to answer the user's question accurately.
-    4. If the sources conflict, prioritize the Transcript as it is the raw record.
-    `
-
-    console.log("🧠 Hybrid Context Built. Sending to LLM...");
-
-    const answer = await chatWithAI(systemPrompt, question)
-
-    return {
-        answer,
-        // We return vector sources for UI citations, Graph sources are implicit in the answer
-        sources: vectorResults.map(result => ({
-            meetingId: result.metadata?.meetingId,
-            meetingTitle: result.metadata?.meetingTitle,
-            content: result.metadata?.content,
-            speakerName: result.metadata?.speakerName,
-            confidence: result.score
-        }))
+      }
     }
+  }
+
+  return [...seen.values()]
+}
+
+// ─────────────────────────────────────────────
+// STEP 3: BM25 KEYWORD SEARCH
+// Loads all chunks for the user from DB, runs in-memory BM25
+// ─────────────────────────────────────────────
+
+async function bm25Search(
+  question: string,
+  userId: string
+): Promise<CandidateDoc[]> {
+  // Your schema: TranscriptChunk → Meeting.createdById (not userId directly)
+  // First get the user's meeting IDs, then fetch chunks for those meetings
+  const userMeetings = await prisma.meeting.findMany({
+    where: { createdById: userId },
+    select: { id: true, title: true },
+  })
+
+  if (userMeetings.length === 0) return []
+
+  const meetingIdToTitle = new Map(userMeetings.map(m => [m.id, m.title]))
+  const meetingIds = userMeetings.map(m => m.id)
+
+  const chunks = await prisma.transcriptChunk.findMany({
+    where: {
+      meetingId: { in: meetingIds },
+    },
+    select: {
+      vectorId: true,    // String | null in schema
+      content: true,
+      speakerName: true,
+      meetingId: true,
+      chunkIndex: true,
+    },
+    take: 2000,
+  })
+
+  if (chunks.length === 0) return []
+
+  const docs: BM25Document[] = chunks.map(c => ({
+    // vectorId is nullable — fall back to a deterministic composite id
+    id: c.vectorId ?? `${c.meetingId}_chunk_${c.chunkIndex}`,
+    content: c.content,
+    metadata: {
+      meetingId: c.meetingId,
+      speakerName: c.speakerName,
+      meetingTitle: meetingIdToTitle.get(c.meetingId) ?? "Untitled Meeting",
+      content: c.content,
+    },
+  }))
+
+  const index = new BM25Index().build(docs)
+  const results = index.search(question, BM25_TOP_K)
+
+  return results.map(r => ({
+    id: r.id,
+    content: r.content,
+    metadata: r.metadata,
+    score: r.score,
+    source: "bm25" as const,
+  }))
+}
+
+// ─────────────────────────────────────────────
+// STEP 4: MERGE vector + BM25, mark overlap
+// ─────────────────────────────────────────────
+
+function mergeResults(
+  vectorDocs: CandidateDoc[],
+  bm25Docs: CandidateDoc[]
+): CandidateDoc[] {
+  const merged = new Map<string, CandidateDoc>()
+
+  for (const doc of vectorDocs) {
+    merged.set(doc.id, { ...doc, source: "vector" })
+  }
+
+  for (const doc of bm25Docs) {
+    const existing = merged.get(doc.id)
+    if (existing) {
+      // Found by both — mark it, combine scores
+      merged.set(doc.id, {
+        ...existing,
+        source: "both",
+        score: (existing.score ?? 0) + (doc.score ?? 0) * 0.3, // small BM25 boost
+      })
+    } else {
+      merged.set(doc.id, doc)
+    }
+  }
+
+  // Sort by score descending before sending to reranker
+  return [...merged.values()].sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+}
+
+// ─────────────────────────────────────────────
+// PARENT EXPANSION
+// After reranking, swap child content for parent content.
+// This is the "Parent-Child" payoff — retrieval used the
+// precise child, but the LLM gets the full surrounding context.
+// ─────────────────────────────────────────────
+
+async function expandToParentContent<T extends { id: string; metadata: Record<string, unknown> }>(
+  docs: T[]
+): Promise<(T & { content: string })[]> {
+  // Group docs by parentChunkId
+  const parentChunkIds = docs
+    .map(d => d.metadata?.parentChunkId as string | undefined)
+    .filter((id): id is string => !!id)
+
+  if (parentChunkIds.length === 0) {
+    // No parent chunks — return child content as-is
+    return docs.map(d => ({
+      ...d,
+      content: String(d.metadata?.content ?? ""),
+    }))
+  }
+
+  // Fetch parent content from DB in one query
+  const parentRows = await prisma.transcriptChunk.findMany({
+    where: { parentChunkId: { in: parentChunkIds } },
+    select: { parentChunkId: true, parentContent: true },
+    distinct: ["parentChunkId"],
+  })
+
+  const parentMap = new Map(
+    parentRows.map(r => [r.parentChunkId!, r.parentContent ?? ""])
+  )
+
+  return docs.map(d => {
+    const pid = d.metadata?.parentChunkId as string | undefined
+    const parentContent = pid ? parentMap.get(pid) : undefined
+    return {
+      ...d,
+      // Use parent if available, else fall back to child content from metadata
+      content: parentContent || String(d.metadata?.content ?? ""),
+    }
+  })
+}
+
+// ─────────────────────────────────────────────
+// UPGRADED: GLOBAL HYBRID CHAT  (Phase 1 + 2)
+// ─────────────────────────────────────────────
+
+export async function chatWithAllMeetings(userId: string, question: string) {
+  console.log(`🧠 Hybrid RAG: "${question}"`)
+
+  // ── Redis cache check ─────────────────────────────────────
+  const cached = await getCachedResponse(question, userId)
+  if (cached) {
+    console.log("⚡ Cache hit")
+    return { answer: cached, sources: [], fromCache: true }
+  }
+
+  // ── Expand query ──────────────────────────────────────────
+  const queries = await expandQuery(question)
+  console.log(`📝 Query variants: ${queries.length}`)
+
+  // ── Parallel: multi-query vector, BM25, Neo4j ────────────
+  const [vectorDocs, bm25Docs, graphKnowledge] = await Promise.all([
+    multiQueryVectorSearch(queries, userId),
+    bm25Search(question, userId),
+    queryGraphMemory(question),
+  ])
+
+  console.log(`🔍 Vector: ${vectorDocs.length} | BM25: ${bm25Docs.length}`)
+
+  // ── Merge ─────────────────────────────────────────────────
+  const merged = mergeResults(vectorDocs, bm25Docs)
+  console.log(`🔀 Merged: ${merged.length} unique candidates`)
+
+  // ── Rerank ────────────────────────────────────────────────
+  const reranked = await cohereRerank(question, merged, RERANK_TOP_N)
+  console.log(`✅ Reranked → top ${reranked.length} docs`)
+
+  // ── Phase 2a: Expand child → parent content ───────────────
+  const expanded = await expandToParentContent(reranked)
+  console.log(`📖 Parent expansion complete`)
+
+  // ── Phase 2b: Context compression ─────────────────────────
+  // Strip irrelevant sentences from each expanded chunk.
+  // Uses llama-3.1-8b-instant (fast + cheap), runs in parallel.
+  const compressed = await compressChunks(expanded, question)
+  const avgRatio = compressed.reduce((s, c) => s + c.compressionRatio, 0) / compressed.length
+  console.log(`✂️ Compression done. Avg ratio: ${(avgRatio * 100).toFixed(0)}% of original`)
+
+  // ── Build hybrid super-context ────────────────────────────
+  const vectorContext = compressed
+    .map(r => {
+      const title   = String(r.metadata?.meetingTitle ?? "Untitled Meeting")
+      const speaker = String(r.metadata?.speakerName  ?? "Unknown")
+      const tag     = r.source === "both" ? " [★ keyword+semantic match]" : ""
+      const compressed_tag = r.wasCompressed ? " [✂ compressed]" : ""
+      return `[Meeting: ${title}]${tag}${compressed_tag} ${speaker}: ${r.content}`
+    })
+    .join("\n\n")
+
+  const systemPrompt = `You are an advanced AI assistant with access to the user's corporate memory.
+
+You have two sources of information:
+
+--- SOURCE 1: KNOWLEDGE GRAPH (Structured Facts) ---
+${graphKnowledge || "No direct relationships found in the graph."}
+
+--- SOURCE 2: TRANSCRIPT FRAGMENTS (Discussion Context) ---
+${vectorContext}
+
+INSTRUCTIONS:
+1. Use the Knowledge Graph to identify specific entities, roles, and relationships.
+2. Use the Transcripts to understand the nuance, context, and discussions.
+3. Synthesize both sources to answer accurately.
+4. Entries marked [★ keyword+semantic match] were found by BOTH retrieval methods — highly reliable.
+5. If sources conflict, prioritize the Transcript as it is the raw record.`
+
+  const answer = await chatWithAI(systemPrompt, question)
+
+  // ── Cache the answer ──────────────────────────────────────
+  await setCachedResponse(question, answer, userId)
+
+  return {
+    answer,
+    fromCache: false,
+    sources: reranked.map((r, i) => ({
+      meetingId:    r.metadata?.meetingId,
+      meetingTitle: r.metadata?.meetingTitle,
+      content:      compressed[i]?.content ?? r.content,  // compressed version for UI
+      speakerName:  r.metadata?.speakerName,
+      confidence:   r.rerankScore,
+      source:       r.source,
+      wasCompressed: compressed[i]?.wasCompressed ?? false,
+    })),
+    debug: {
+      queryVariants:      queries,
+      vectorCandidates:   vectorDocs.length,
+      bm25Candidates:     bm25Docs.length,
+      mergedCandidates:   merged.length,
+      finalDocs:          reranked.length,
+      avgCompressionRatio: avgRatio,
+    },
+  }
 }

@@ -1,86 +1,224 @@
-import { prisma } from "@/lib/db";
-import { incrementMeetingUsage } from "@/lib/usage";
-import { NextRequest, NextResponse } from "next/server";
-import { Client } from "@upstash/qstash";
+import { NextRequest, NextResponse } from "next/server"
+import { PrismaClient } from "@prisma/client"
+import { Client } from "@upstash/qstash"
+import { normalizeTranscript, validateTranscript } from "@/lib/transcript-parser"
+import { transcribeAudioFromUrl } from "@/lib/transcript"
 
-// Initialize Queue Client
-const client = new Client({ token: process.env.QSTASH_TOKEN! });
+// Isolated Prisma client for webhook — doesn't share pool with rest of app
+const webhookPrisma = new PrismaClient({
+  datasourceUrl: process.env.DATABASE_URL,
+  log: ["error"]
+})
+
+const client = new Client({ token: process.env.QSTASH_TOKEN! })
+
+const processedBots = new Set<string>()
 
 export async function POST(request: NextRequest) {
-    try {
-        const bodyText = await request.text();
-        const webhook = JSON.parse(bodyText);
-        
-        // 🔍 DEBUG: Print exactly what MeetingBaas is sending
-        console.log("🔥 [WEBHOOK EVENT DETECTED]:", webhook.event);
-        
-        // Extract Data safely
-        const webhookData = webhook.data || {};
-        const botId = webhookData.bot_id || webhook.bot_id;
+  try {
+    const bodyText = await request.text()
+    const webhook = JSON.parse(bodyText)
+    const webhookData = webhook.data || {}
+    const botId = webhookData.bot_id || webhook.bot_id
 
-        // ✅ THE FIX: Process the meeting if we have a bot_id, REGARDLESS of the event name,
-        // as long as it contains transcript/video data or says it's complete.
-        const isCompletionEvent = 
-            webhook.event === 'complete' || 
-            webhook.event === 'meeting.ended' || 
-            webhook.event === 'bot.status_change' ||
-            webhook.event === 'bot_data' ||
-            webhookData.transcript || 
-            webhookData.mp4;
+    const isCompletionEvent =
+      webhook.event === "complete" ||
+      webhook.event === "meeting.ended" ||
+      webhook.event === "bot_data" ||
+      webhookData.transcript ||
+      webhookData.audio ||
+      webhookData.mp4
 
-        if (botId && isCompletionEvent) {
-            console.log(`🔔 Processing data for Bot ID: ${botId}`);
-
-            const meeting = await prisma.meeting.findFirst({
-                where: { botId: botId },
-                include: { createdBy: true }
-            });
-
-            if (!meeting) {
-                console.error('❌ Meeting not found in DB for bot id:', botId);
-                return NextResponse.json({ error: 'meeting not found' }, { status: 200 });
-            }
-
-            // Update Database
-            await incrementMeetingUsage(meeting.createdById);
-            
-            await prisma.meeting.update({
-                where: { id: meeting.id },
-                data: {
-                    meetingEnded: true,
-                    transcriptReady: true,
-                    transcript: webhookData.transcript || meeting.transcript, 
-                    recordingUrl: webhookData.mp4 || meeting.recordingUrl,
-                    speakers: webhookData.speakers || meeting.speakers
-                }
-            });
-
-            // Dispatch to QStash Queue for AI Summary
-            const appUrl = process.env.NEXT_PUBLIC_APP_URI; 
-            try {
-                const response = await client.publishJSON({
-                    url: `${appUrl}/api/queue/process-meeting`,
-                    body: {
-                        meetingId: meeting.id,
-                        transcript: webhookData.transcript,
-                        botId: botId,
-                        meetingTitle: meeting.title 
-                    },
-                    retries: 0
-                });
-                console.log(`📨 Job sent to Queue (Msg ID: ${response.messageId}) for Meeting: ${meeting.title}`);
-            } catch (queueError) {
-                console.error("❌ Failed to queue job:", queueError);
-            }
-
-            return NextResponse.json({ success: true, message: 'Processed successfully' });
-        }
-
-        // Acknowledge other random webhook pings (like bot joining, bot leaving)
-        return NextResponse.json({ success: true, ignored: true });
-
-    } catch (error) {
-        console.error('Webhook error:', error);
-        return NextResponse.json({ error: 'Internal Error' }, { status: 500 });
+    if (!botId || !isCompletionEvent) {
+      return NextResponse.json({ success: true, ignored: true })
     }
+
+    if (processedBots.has(botId)) {
+      console.log(`⚠️ Duplicate webhook for bot ${botId} — ignoring`)
+      return NextResponse.json({ success: true, deduplicated: true })
+    }
+
+    processedBots.add(botId)
+    setTimeout(() => processedBots.delete(botId), 5 * 60 * 1000)
+
+    processWebhook(botId, webhookData).catch(err =>
+      console.error("❌ Background processing failed:", err)
+    )
+
+    return NextResponse.json({ success: true, message: "Processing started" })
+
+  } catch (error) {
+    console.error("Webhook error:", error)
+    return NextResponse.json({ success: true })
+  }
+}
+
+async function processWebhook(botId: string, webhookData: any) {
+  try {
+    console.log(`🔔 Processing data for Bot ID: ${botId}`)
+
+    const meeting = await webhookPrisma.meeting.findFirst({
+      where: { botId },
+      include: { createdBy: true }
+    })
+
+    if (!meeting) {
+      console.error("❌ Meeting not found for bot id:", botId)
+      return
+    }
+    await webhookPrisma.$disconnect()
+    let parsedTranscript: any = meeting.transcript
+
+    const transcriptHasContent =
+      webhookData.transcript &&
+      Array.isArray(webhookData.transcript) &&
+      webhookData.transcript.some((seg: any) => seg.words && seg.words.length > 0)
+
+    if ((!webhookData.transcript || !transcriptHasContent) && webhookData.audio) {
+      console.log(`🎙️ No transcript content. Transcribing audio with Groq Whisper...`)
+      try {
+        const transcribedSegments = await transcribeAudioFromUrl(webhookData.audio)
+        if (transcribedSegments && transcribedSegments.length > 0) {
+          if (webhookData.transcript && Array.isArray(webhookData.transcript) && webhookData.transcript.length > 0) {
+            const merged = mergeTranscriptWithSpeakers(webhookData.transcript, transcribedSegments)
+            parsedTranscript = merged.length > 0 ? merged : transcribedSegments
+          } else {
+            parsedTranscript = transcribedSegments
+          }
+          console.log(`✅ Audio transcribed: ${transcribedSegments.length} segments`)
+        }
+      } catch (err) {
+        console.error("❌ Transcription failed:", err)
+      }
+    } else if (webhookData.transcript && transcriptHasContent) {
+      try {
+        let rawTranscript = webhookData.transcript
+        if (typeof webhookData.transcript === "string") {
+          rawTranscript = JSON.parse(webhookData.transcript)
+        }
+        const normalized = normalizeTranscript(rawTranscript)
+        if (normalized && validateTranscript(normalized)) {
+          parsedTranscript = normalized
+          console.log(`✅ Transcript normalized: ${normalized.length} segments`)
+        } else {
+          parsedTranscript = rawTranscript
+        }
+      } catch (e) {
+        parsedTranscript = webhookData.transcript
+      }
+    }
+
+    console.log("📝 Transcript type:", typeof parsedTranscript, "Is null:", parsedTranscript === null)
+    await webhookPrisma.$connect()
+    await webhookPrisma.meeting.update({
+      where: { id: meeting.id },
+      data: {
+        meetingEnded: true,
+        transcriptReady: true,
+        transcript: parsedTranscript,
+        recordingUrl: webhookData.mp4 || meeting.recordingUrl,
+        speakers: webhookData.speakers || meeting.speakers
+      }
+    })
+
+    const updatedMeeting = await webhookPrisma.meeting.findUnique({
+      where: { id: meeting.id }
+    })
+
+    if (!updatedMeeting?.transcript) {
+      console.log(`⏳ Transcript not ready for meeting ${meeting.id}`)
+      return
+    }
+
+    console.log(`📝 Transcript ready (${JSON.stringify(updatedMeeting.transcript).length} bytes). Queuing...`)
+
+    const appUrl = process.env.NEXT_PUBLIC_APP_URI
+    const response = await client.publishJSON({
+      url: `${appUrl}/api/queue/process-meeting`,
+      body: {
+        meetingId: meeting.id,
+        transcript: updatedMeeting.transcript,
+        botId,
+        meetingTitle: meeting.title
+      },
+      retries: 0
+    })
+
+    console.log(`📨 Job queued (Msg ID: ${response.messageId}) for Meeting: ${meeting.title}`)
+
+  } finally {
+    await webhookPrisma.$disconnect()
+  }
+}
+
+function mergeTranscriptWithSpeakers(originalSegments: any[], transcribedSegments: any[]): any[] {
+  if (!transcribedSegments || transcribedSegments.length === 0) return originalSegments
+
+  const fullText = transcribedSegments
+    .map((seg: any) => seg.words?.map((w: any) => w.word).join(" ") || "")
+    .join(" ").trim()
+
+  if (!fullText) return originalSegments
+
+  const words = fullText.split(/\s+/).filter((w: string) => w.length > 0)
+  
+  // Filter out zero-duration segments and segments with no meaningful duration
+  const validSegments = originalSegments.filter((seg: any) => {
+    const startTime = seg.start_time || seg.offset || 0
+    const endTime = seg.end_time || startTime + 1
+    return (endTime - startTime) > 0.1 // skip segments shorter than 100ms
+  })
+
+  // Calculate total duration for proportional word distribution
+  const totalDuration = validSegments.reduce((sum: number, seg: any) => {
+    const startTime = seg.start_time || seg.offset || 0
+    const endTime = seg.end_time || startTime + 1
+    return sum + (endTime - startTime)
+  }, 0)
+
+  let wordIndex = 0
+  const merged: any[] = []
+
+  for (const originalSeg of validSegments) {
+    const speaker = originalSeg.speaker || "Unknown"
+    const offset = originalSeg.offset || originalSeg.start_time || 0
+    const startTime = originalSeg.start_time || offset
+    const endTime = originalSeg.end_time || startTime + 1
+    const duration = endTime - startTime
+
+    // Proportional word count based on duration
+    const proportion = duration / totalDuration
+    const estimatedWords = Math.max(1, Math.round(proportion * words.length))
+    const segmentTextWords = words.slice(wordIndex, wordIndex + estimatedWords)
+    const segmentWords: any[] = []
+
+    if (segmentTextWords.length > 0) {
+      const timePerWord = duration / Math.max(1, segmentTextWords.length)
+      let currentTime = startTime
+      for (const word of segmentTextWords) {
+        segmentWords.push({ word, start: currentTime, end: currentTime + timePerWord })
+        currentTime += timePerWord
+      }
+      wordIndex += estimatedWords
+    }
+
+    merged.push({ speaker, offset, start_time: startTime, end_time: endTime, words: segmentWords })
+  }
+
+  // If any words remain unassigned, add them to the last segment
+  if (wordIndex < words.length && merged.length > 0) {
+    const remaining = words.slice(wordIndex)
+    const lastSeg = merged[merged.length - 1]
+    const lastWordEnd = lastSeg.words?.[lastSeg.words.length - 1]?.end || lastSeg.end_time
+    remaining.forEach((word, i) => {
+      lastSeg.words.push({
+        word,
+        start: lastWordEnd + i * 0.3,
+        end: lastWordEnd + (i + 1) * 0.3
+      })
+    })
+  }
+
+  console.log(`✅ Merged ${merged.length} segments (filtered from ${originalSegments.length})`)
+  return merged
 }

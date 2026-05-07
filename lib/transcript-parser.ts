@@ -69,7 +69,6 @@ function parseRawTranscriptArray(data: any[]): TranscriptSegment[] | null {
             console.log(`📋 [SEGMENT ${i}] Words array:`, item.words ? `${item.words.length} items` : 'missing');
         }
 
-        // If no text but has words array with content, extract from there
         if (!text && item.words && item.words.length > 0) {
             text = item.words.map((w: any) => (typeof w === 'string' ? w : w.word || w.text || '')).join(' ');
         }

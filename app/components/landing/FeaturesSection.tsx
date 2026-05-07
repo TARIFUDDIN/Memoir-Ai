@@ -46,13 +46,14 @@ const features = [
     },
 ]
 
-function FeaturesSection() {
+function FeaturesSection ()
+{
     return (
         <section className='py-20 bg-black'>
             <div className='max-w-6xl mx-auto px-4'>
                 <div className='text-center mb-16'>
                     <h2 className='text-3xl md:text-4xl font-bold text-white mb-4'>
-                        Everything you need for{' '}
+                        Everything you need for{ ' ' }
                         <span className="bg-gradient-to-r from-blue-400 via-blue-500 to-blue-600  bg-clip-text text-transparent">
                             Smarter Meetings
                         </span>
@@ -63,23 +64,23 @@ function FeaturesSection() {
 
                 </div>
                 <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-8">
-                    {features.map((feature, index) => (
+                    { features.map( ( feature, index ) => (
                         <div
-                            key={index}
+                            key={ index }
                             className='bg-gray-900/50 border border-gray-800 rounded-xl p-6 hover:bg-gray-900/70 hover:border-gray-700 transition-all'
                         >
-                            <div className={`w-12 h-12 ${feature.bgColor} rounded-lg flex items-center justify-center mb-4`}>
-                                <feature.icon className={`w-6 h-6 ${feature.color}`} />
+                            <div className={ `w-12 h-12 ${ feature.bgColor } rounded-lg flex items-center justify-center mb-4` }>
+                                <feature.icon className={ `w-6 h-6 ${ feature.color }` } />
                             </div>
                             <h3 className='text-xl font-semibold text-white mb-2'>
-                                {feature.title}
+                                { feature.title }
                             </h3>
                             <p className='text-gray-400'>
-                                {feature.description}
+                                { feature.description }
                             </p>
 
                         </div>
-                    ))}
+                    ) ) }
                 </div>
 
             </div>
