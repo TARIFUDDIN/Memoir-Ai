@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "postinstall": "prisma generate"
+    "postinstall": "prisma generate",
+    "dev:db": "node -e \"setInterval(()=>fetch('http://localhost:3000/api/health'),240000)\""
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.850.0",

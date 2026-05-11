@@ -1,122 +1,126 @@
 /**
- * lib/compressor.ts — Context Compression (Phase 2)
+ * lib/compressor.ts
  *
- * After retrieval, before the LLM call:
- *   1. Each retrieved chunk is passed to a small fast Groq call.
- *   2. Groq extracts ONLY the sentences relevant to the user's question.
- *   3. Irrelevant filler is dropped → fewer tokens → lower cost, better answers.
+ * Context compression — strips irrelevant sentences from retrieved chunks
+ * before passing them to the final LLM.
  *
- * Falls back to the original chunk if compression fails or returns empty.
+ * Free-tier Groq limits (on_demand):
+ *   llama-3.1-8b-instant  → 6,000 TPM
+ *   llama-3.3-70b-versatile → 12,000 TPM
  *
- * Uses llama-3.1-8b-instant (fastest/cheapest Groq model) — not the 70b.
- * Runs all chunks in parallel so latency is bounded by the slowest chunk,
- * not the sum of all chunks.
+ * Strategy: truncate each chunk to MAX_CHUNK_CHARS before sending,
+ * then ask the model to extract only the relevant parts.
+ * If the model still errors (rate-limit or 413), fall back to the
+ * truncated text as-is — never crash the whole pipeline.
  */
 
 import Groq from "groq-sdk"
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY! })
+const groq = new Groq( { apiKey: process.env.GROQ_API_KEY! } )
 
-// Use the small fast model — compression doesn't need reasoning power
+// llama-3.1-8b-instant is ~4 chars/token → 4000 tokens ≈ 16 000 chars
+// Keep well below 6K TPM: system prompt ~200 tokens + question ~50 tokens
+// → leave ~1500 tokens for the chunk content (= ~6000 chars)
+const MAX_CHUNK_CHARS = 3000   // hard truncate before sending
 const COMPRESSION_MODEL = "llama-3.1-8b-instant"
-
-// Don't compress chunks shorter than this — nothing to compress
-const MIN_COMPRESS_LENGTH = 200
+const MAX_OUTPUT_TOKENS = 250    // we only want the compressed excerpt
 
 export type CompressedChunk = {
-  originalContent: string
-  compressedContent: string
+  id: string
+  content: string
+  metadata: Record<string, unknown>
+  score?: number
+  rerankScore?: number
+  source?: string
+  compressionRatio: number
   wasCompressed: boolean
-  compressionRatio: number   // 0-1, lower = more compressed
 }
 
-/**
- * Compress a single chunk — extract only sentences relevant to the question.
- */
-async function compressChunk(
-  chunk: string,
-  question: string
-): Promise<string> {
-  // Skip tiny chunks
-  if (chunk.length < MIN_COMPRESS_LENGTH) return chunk
+// ─── Single chunk ──────────────────────────────────────────────────────────
 
-  try {
-    const response = await groq.chat.completions.create({
+async function compressChunk (
+  chunk: { id: string; content: string; metadata: Record<string, unknown> },
+  question: string
+): Promise<CompressedChunk>
+{
+  const original = chunk.content
+
+  // Hard truncate — never send more than MAX_CHUNK_CHARS to Groq
+  const truncated = original.length > MAX_CHUNK_CHARS
+    ? original.slice( 0, MAX_CHUNK_CHARS ) + "…"
+    : original
+
+  try
+  {
+    const response = await groq.chat.completions.create( {
       model: COMPRESSION_MODEL,
-      temperature: 0,          // deterministic extraction
-      max_tokens: 300,
+      temperature: 0,
+      max_tokens: MAX_OUTPUT_TOKENS,
       messages: [
         {
           role: "system",
-          content: `You are a context extractor. Given a meeting transcript excerpt and a question,
-extract ONLY the sentences from the excerpt that are directly relevant to answering the question.
-
-Rules:
-- Copy relevant sentences verbatim — do not paraphrase or summarize
-- Preserve speaker labels (e.g. "Alice: ...")
-- If NO sentences are relevant, reply with exactly: IRRELEVANT
-- Output only the extracted sentences, nothing else`,
+          content: "Extract only the sentences directly relevant to the question. Return the extracted text only — no preamble, no explanation.",
         },
         {
           role: "user",
-          content: `QUESTION: ${question}
-
-EXCERPT:
-${chunk}`,
+          content: `Question: ${ question }\n\nText:\n${ truncated }`,
         },
       ],
-    })
+    } )
 
-    const compressed = response.choices[0]?.message?.content?.trim() ?? ""
+    const compressed = response.choices[ 0 ]?.message?.content?.trim() ?? ""
 
-    // If model says nothing relevant, return empty string (caller handles fallback)
-    if (compressed === "IRRELEVANT" || compressed.length === 0) return ""
-
-    return compressed
-  } catch (err) {
-    console.warn("⚠️ Compression failed for chunk, using original:", err)
-    return chunk
-  }
-}
-
-/**
- * compressChunks
- *
- * Takes an array of retrieved doc contents + the user question.
- * Returns compressed versions — or originals if compression would make things worse.
- *
- * @param chunks   Array of { id, content, metadata } objects
- * @param question The user's question
- */
-export async function compressChunks<T extends { id: string; content: string }>(
-  chunks: T[],
-  question: string
-): Promise<(T & CompressedChunk)[]> {
-  if (chunks.length === 0) return []
-
-  // Run all compressions in parallel
-  const compressions = await Promise.all(
-    chunks.map(chunk => compressChunk(chunk.content, question))
-  )
-
-  return chunks.map((chunk, i) => {
-    const compressed = compressions[i] ?? ""
-
-    // Fallback: if empty or longer than original, keep original
-    const useCompressed =
-      compressed.length > 0 && compressed.length < chunk.content.length
-
-    const finalContent = useCompressed ? compressed : chunk.content
+    if ( !compressed || compressed.length < 10 )
+    {
+      // Model returned nothing useful — use truncated original
+      return {
+        ...chunk,
+        content: truncated,
+        compressionRatio: truncated.length / original.length,
+        wasCompressed: false,
+      }
+    }
 
     return {
       ...chunk,
-      content: finalContent,             // overwrite content in place
-      originalContent: chunk.content,
-      compressedContent: compressed,
-      wasCompressed: useCompressed,
-      compressionRatio: useCompressed
-        ? compressed.length / chunk.content.length
-        : 1,
+      content: compressed,
+      compressionRatio: compressed.length / original.length,
+      wasCompressed: true,
     }
-  })
+  } catch ( err )
+  {
+    // Rate limit or any other error → fall back silently to truncated original
+    console.warn( `⚠️ Compression failed for chunk, using truncated original:`, ( err as Error ).message?.slice( 0, 120 ) )
+    return {
+      ...chunk,
+      content: truncated,
+      compressionRatio: truncated.length / original.length,
+      wasCompressed: false,
+    }
+  }
+}
+
+// ─── Batch with concurrency cap ────────────────────────────────────────────
+// Free tier: 6K TPM shared across all concurrent requests.
+// Run sequentially (concurrency=1) to avoid smashing the limit.
+// With truncation at 3K chars ≈ 750 tokens per chunk, 6 chunks = ~4.5K tokens — safe.
+
+export async function compressChunks (
+  chunks: Array<{ id: string; content: string; metadata: Record<string, unknown>; score?: number; rerankScore?: number; source?: string }>,
+  question: string,
+  concurrency = 1
+): Promise<CompressedChunk[]>
+{
+  const results: CompressedChunk[] = []
+
+  // Process in batches of `concurrency`
+  for ( let i = 0; i < chunks.length; i += concurrency )
+  {
+    const batch = chunks.slice( i, i + concurrency )
+    const batchResults = await Promise.all(
+      batch.map( chunk => compressChunk( chunk, question ) )
+    )
+    results.push( ...batchResults )
+  }
+  return results
 }

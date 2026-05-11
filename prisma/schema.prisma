@@ -153,17 +153,21 @@ model Meeting {
 }
 
 model TranscriptChunk {
-  id          String   @id @default(cuid())
-  meetingId   String
-  chunkIndex  Int
-  content     String   @db.Text
-  speakerName String?
-  vectorId    String?
-  
-  createdAt   DateTime @default(now())
-  meeting     Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  id            String   @id @default(cuid())
+  meetingId     String
+  chunkIndex    Int
+  content       String   @db.Text
+  speakerName   String?
+  vectorId      String?
+  parentContent String?  @db.Text
+  parentChunkId String?
+  isChildChunk  Boolean  @default(false)
+
+  createdAt     DateTime @default(now())
+  meeting       Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
 
   @@index([meetingId])
+  @@index([parentChunkId])
 }
 
 model SlackInstallation {
