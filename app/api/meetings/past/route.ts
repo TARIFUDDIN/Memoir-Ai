@@ -25,7 +25,8 @@ export async function GET() {
 
         return NextResponse.json({ meetings: pastMeetings })
 
-    } catch (error) {
-        return NextResponse.json({ error: 'failed to fetch past meetings', meetings: [] }, { status: 500 })
+    } catch (error: any) {
+        console.error('Error fetching past meetings:', error);
+        return NextResponse.json({ error: 'failed to fetch past meetings', message: error?.message, meetings: [] }, { status: 500 })
     }
 }

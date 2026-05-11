@@ -5,7 +5,10 @@ import { NextResponse } from "next/server"
 import { google } from "googleapis"
 import { Client } from "@upstash/qstash"
 
-const qstashClient = new Client({ token: process.env.QSTASH_TOKEN! })
+const qstashClient = process.env.QSTASH_TOKEN ? new Client({ 
+    token: process.env.QSTASH_TOKEN,
+    baseUrl: process.env.QSTASH_URL
+}) : null;
 export async function GET() {
     try {
         const { userId } = await auth()
@@ -85,6 +88,7 @@ export async function GET() {
                             
                             if (startTimestamp > now) {
                                 try {
+                                    if (!qstashClient) throw new Error("QSTASH_TOKEN missing");
                                     await qstashClient.publishJSON({
                                         url: `${process.env.NEXT_PUBLIC_APP_URI}/api/meetings/${upsertedMeeting.id}/bot-toggle`,
                                         body: { botScheduled: true },
@@ -140,8 +144,8 @@ export async function GET() {
             source: 'synced-database'
         })
 
-    } catch (error) {
+    } catch (error: any) {
         console.error('Error fetching meetings:', error)
-        return NextResponse.json({ error: "Failed to sync meetings" }, { status: 500 })
+        return NextResponse.json({ error: "Failed to sync meetings", message: error?.message }, { status: 500 })
     }
 }

@@ -1,6 +1,16 @@
 import { Redis } from "@upstash/redis"
 
-const redis = Redis.fromEnv()
+let redis: Redis | null = null;
+try
+{
+    if ( process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN )
+    {
+        redis = Redis.fromEnv()
+    }
+} catch ( e )
+{
+    console.warn( "Redis env missing" )
+}
 
 // Probe once per process — if unreachable, skip all Redis calls silently
 let redisAvailable: boolean | null = null
@@ -8,6 +18,11 @@ let redisAvailable: boolean | null = null
 async function isRedisReachable (): Promise<boolean>
 {
     if ( redisAvailable !== null ) return redisAvailable
+    if ( !redis )
+    {
+        redisAvailable = false;
+        return false;
+    }
     try
     {
         await redis.ping()
@@ -28,7 +43,7 @@ export async function getCachedResponse ( prompt: string, userId: string )
     {
         const sanitizedPrompt = prompt.trim().toLowerCase()
         const key = `cache:${ userId }:${ Buffer.from( sanitizedPrompt ).toString( 'base64' ) }`
-        const cached = await redis.get( key )
+        const cached = await redis?.get( key )
         return cached as string | null
     } catch ( error )
     {
@@ -44,7 +59,7 @@ export async function setCachedResponse ( prompt: string, response: string, user
     {
         const sanitizedPrompt = prompt.trim().toLowerCase()
         const key = `cache:${ userId }:${ Buffer.from( sanitizedPrompt ).toString( 'base64' ) }`
-        await redis.set( key, response, { ex: 3600 } )
+        await redis?.set( key, response, { ex: 3600 } )
     } catch ( error )
     {
         console.error( "Cache Set Failed", error )

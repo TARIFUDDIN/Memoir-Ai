@@ -24,7 +24,10 @@ const webhookPrisma = new PrismaClient( {
   log: [ "error" ],
 } )
 
-const qstash = new Client( { token: process.env.QSTASH_TOKEN! } )
+const qstash = new Client( { 
+  token: process.env.QSTASH_TOKEN!,
+  baseUrl: process.env.QSTASH_URL
+} )
 
 // ─── Deduplication ────────────────────────────────────────────────────────────
 

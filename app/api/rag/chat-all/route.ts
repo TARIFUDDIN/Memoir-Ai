@@ -68,10 +68,11 @@ export async function POST(request: NextRequest) {
 
         return NextResponse.json(response)
 
-    } catch (error) {
+    } catch (error: any) {
         console.error('error in chat:', error)
         return NextResponse.json({
             error: 'failed to process question',
+            message: error?.message,
             answer: "I encountered an error while searching your meetings. please try again."
         }, { status: 500 })
     }
