@@ -4,17 +4,33 @@ import { Client } from "@upstash/qstash"
 import { normalizeTranscript, validateTranscript } from "@/lib/transcript-parser"
 import { transcribeAudioFromUrl } from "@/lib/transcript"
 
-// ✅ FIX 1: Add connection pool settings so Supabase doesn't drop idle connections.
-//    The Whisper call can take 60-120s — without pool_timeout the connection
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+/**
+ * The set of task types that each independent QStash job can handle.
+ * Keep this in sync with the `taskType` switch in process-meeting/route.ts.
+ */
+export type MeetingTaskType = "SUMMARY" | "RISK" | "SENTIMENT" | "PROFILES" | "GRAPH"
+
+const ALL_TASK_TYPES: MeetingTaskType[] = [ "SUMMARY", "RISK", "SENTIMENT", "PROFILES", "GRAPH" ]
+
+// ─── Clients ──────────────────────────────────────────────────────────────────
+
+// ✅ Add connection pool settings so Supabase doesn't drop idle connections.
+//    The Whisper call can take 60-120 s — without pool_timeout the connection
 //    times out while we wait, then the subsequent .update() fails.
 const webhookPrisma = new PrismaClient( {
   datasourceUrl: process.env.DATABASE_URL,
   log: [ "error" ],
 } )
 
-const client = new Client( { token: process.env.QSTASH_TOKEN! } )
+const qstash = new Client( { token: process.env.QSTASH_TOKEN! } )
+
+// ─── Deduplication ────────────────────────────────────────────────────────────
 
 const processedBots = new Set<string>()
+
+// ─── Route handler ────────────────────────────────────────────────────────────
 
 export async function POST ( request: NextRequest )
 {
@@ -47,6 +63,7 @@ export async function POST ( request: NextRequest )
     processedBots.add( botId )
     setTimeout( () => processedBots.delete( botId ), 5 * 60 * 1000 )
 
+    // Fire-and-forget — the webhook must return quickly
     processWebhook( botId, webhookData ).catch( ( err ) =>
       console.error( "❌ Background processing failed:", err )
     )
@@ -59,12 +76,11 @@ export async function POST ( request: NextRequest )
   }
 }
 
+// ─── Background processing ───────────────────────────────────────────────────
+
 async function processWebhook ( botId: string, webhookData: any )
 {
-  // ✅ FIX 2: Single try/finally — ONE connect at the start, ONE disconnect at
-  //    the end. The original code did $disconnect() mid-function before the
-  //    Whisper call, then $connect() after — but Supabase had already dropped
-  //    the idle connection by then (especially after a 60-120s Whisper call).
+  // ✅ Single try/finally — ONE connect at the start, ONE disconnect at the end.
   try
   {
     console.log( `🔔 Processing data for Bot ID: ${ botId }` )
@@ -80,23 +96,18 @@ async function processWebhook ( botId: string, webhookData: any )
       return
     }
 
-    // ✅ FIX 3: Do NOT disconnect here. Keep the connection alive across the
-    //    Whisper call. We'll disconnect once in the finally block below.
     let parsedTranscript: any = meeting.transcript
 
     const transcriptHasContent =
       webhookData.transcript &&
       Array.isArray( webhookData.transcript ) &&
-      webhookData.transcript.some(
-        ( seg: any ) => seg.words && seg.words.length > 0
-      )
+      webhookData.transcript.some( ( seg: any ) => seg.words && seg.words.length > 0 )
 
     if ( ( !webhookData.transcript || !transcriptHasContent ) && webhookData.audio )
     {
       console.log( `🎙️ No transcript content — transcribing audio with Groq Whisper...` )
       try
       {
-        // This can take 60-120s. Connection stays alive (no mid-flow disconnect).
         const transcribedSegments = await transcribeAudioFromUrl( webhookData.audio )
         if ( transcribedSegments && transcribedSegments.length > 0 )
         {
@@ -118,16 +129,12 @@ async function processWebhook ( botId: string, webhookData: any )
           console.log( `✅ Audio transcribed: ${ transcribedSegments.length } segments` )
         } else
         {
-          // ✅ FIX 4: Whisper returned null/empty — store null gracefully
-          //    instead of leaving parsedTranscript as the stale meeting.transcript.
           console.warn( "⚠️ Whisper returned no segments — storing null transcript" )
           parsedTranscript = null
         }
       } catch ( err )
       {
         console.error( "❌ Transcription failed:", err )
-        // ✅ FIX 5: Don't crash the whole webhook on transcription failure.
-        //    Mark the meeting as ended with whatever transcript we have (could be null).
         parsedTranscript = meeting.transcript ?? null
       }
     } else if ( webhookData.transcript && transcriptHasContent )
@@ -161,14 +168,12 @@ async function processWebhook ( botId: string, webhookData: any )
       parsedTranscript === null
     )
 
-    // ✅ FIX 6: Always update the meeting — even when parsedTranscript is null.
-    //    The original code only ran the update then bailed if transcript was null,
-    //    leaving meetingEnded=false forever. Now we always mark it ended.
+    // Always update the meeting — even when parsedTranscript is null — so
+    // meetingEnded is never left as false.
     await webhookPrisma.meeting.update( {
       where: { id: meeting.id },
       data: {
         meetingEnded: true,
-        // Only set transcriptReady=true if we actually have content
         transcriptReady: parsedTranscript !== null,
         transcript: parsedTranscript,
         recordingUrl: webhookData.mp4 || meeting.recordingUrl,
@@ -176,7 +181,6 @@ async function processWebhook ( botId: string, webhookData: any )
       },
     } )
 
-    // ✅ FIX 7: Skip the queue if transcript is null — nothing to process.
     if ( !parsedTranscript )
     {
       console.warn(
@@ -196,39 +200,67 @@ async function processWebhook ( botId: string, webhookData: any )
       return
     }
 
-    console.log(
-      `📝 Transcript ready (${ JSON.stringify( updatedMeeting.transcript ).length } bytes). Queuing...`
-    )
+    const transcriptBytes = JSON.stringify( updatedMeeting.transcript ).length
+    console.log( `📝 Transcript ready (${ transcriptBytes } bytes). Fanning out ${ ALL_TASK_TYPES.length } jobs...` )
 
+    // ── Fan-out: one independent QStash job per task type ──────────────────
+    //
+    // Benefits vs a monolithic job:
+    //   • Each task gets its own serverless timeout window.
+    //   • A failure in SENTIMENT doesn't re-run (and re-bill) SUMMARY.
+    //   • QStash retries only the failed task.
+    //   • retries: 3 + exponential backoff handles Groq rate limits gracefully.
+    //
     const appUrl = process.env.NEXT_PUBLIC_APP_URI
-    const response = await client.publishJSON( {
-      url: `${ appUrl }/api/queue/process-meeting`,
-      body: {
-        meetingId: meeting.id,
-        transcript: updatedMeeting.transcript,
-        botId,
-        meetingTitle: meeting.title,
-      },
-      retries: 0,
-    } )
+    const workerUrl = `${ appUrl }/api/queue/process-meeting`
 
-    console.log(
-      `📨 Job queued (Msg ID: ${ response.messageId }) for Meeting: ${ meeting.title }`
+    const basePayload = {
+      meetingId: meeting.id,
+      transcript: updatedMeeting.transcript,
+      botId,
+      meetingTitle: meeting.title,
+    }
+
+    const publishResults = await Promise.allSettled(
+      ALL_TASK_TYPES.map( ( taskType ) =>
+        qstash.publishJSON( {
+          url: workerUrl,
+          body: { ...basePayload, taskType },
+          // Retry with exponential backoff — critical for Groq free-tier rate limits.
+          // QStash default schedule: 1st retry after 1 min, 2nd after 5 min, 3rd after 20 min.
+          retries: 3,
+          // Spread the initial fan-out by taskType index to avoid hammering Groq
+          // with all 5 tasks at exactly the same second.
+          delay: ALL_TASK_TYPES.indexOf( taskType ) * 2, // seconds
+        } )
+      )
     )
+
+    publishResults.forEach( ( result, i ) =>
+    {
+      if ( result.status === "fulfilled" )
+      {
+        console.log( `📨 Queued [${ ALL_TASK_TYPES[ i ] }] msgId=${ result.value.messageId }` )
+      } else
+      {
+        console.error( `❌ Failed to queue [${ ALL_TASK_TYPES[ i ] }]:`, result.reason )
+      }
+    } )
   } finally
   {
-    // ✅ FIX 8: Single disconnect point — always runs, even on error.
+    // ✅ Single disconnect point — always runs, even on error.
     await webhookPrisma.$disconnect()
   }
 }
+
+// ─── Transcript merge helper ─────────────────────────────────────────────────
 
 function mergeTranscriptWithSpeakers (
   originalSegments: any[],
   transcribedSegments: any[]
 ): any[]
 {
-  if ( !transcribedSegments || transcribedSegments.length === 0 )
-    return originalSegments
+  if ( !transcribedSegments || transcribedSegments.length === 0 ) return originalSegments
 
   const fullText = transcribedSegments
     .map( ( seg: any ) => seg.words?.map( ( w: any ) => w.word ).join( " " ) || "" )
