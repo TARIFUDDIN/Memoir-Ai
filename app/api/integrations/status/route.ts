@@ -12,11 +12,16 @@ export async function GET ()
             return NextResponse.json( { error: 'unauthorized' }, { status: 401 } )
         }
 
-        const dbUser = await prisma.user.findFirst( {
-            where: {
-                clerkId: user.id
-            }
-        } )
+        let dbUser = null;
+        try {
+            dbUser = await prisma.user.findFirst( {
+                where: {
+                    clerkId: user.id
+                }
+            } )
+        } catch ( dbError ) {
+            console.error( 'Database error fetching user for integration status:', dbError )
+        }
 
         const result = [ {
             platform: 'google-calendar',
@@ -29,6 +34,6 @@ export async function GET ()
     } catch ( error )
     {
         console.error( 'error fetching integration status:', error )
-        return NextResponse.json( { error: 'Internal error' }, { status: 500 } )
+        return NextResponse.json( [], { status: 200 } )
     }
 }

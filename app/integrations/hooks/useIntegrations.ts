@@ -75,7 +75,8 @@ export function useIntegrations() {
     const fetchIntegrations = async () => {
         try {
             const response = await fetch('/api/integrations/status')
-            const data = await response.json()
+            const responseData = await response.json()
+            const data = Array.isArray(responseData) ? responseData : []
 
             const calendarResponse = await fetch('/api/user/calendar-status')
             const calendarData = await calendarResponse.json()
@@ -84,7 +85,7 @@ export function useIntegrations() {
                 if (integration.platform === 'google-calendar') {
                     return {
                         ...integration,
-                        connected: calendarData.connected || false
+                        connected: calendarData?.connected || false
                     }
                 }
 
