@@ -1,12 +1,17 @@
 /**
- * lib/graph.ts — Phase 3: Deep GraphRAG
+ * lib/graph.ts — Phase 2: Temporal Memory Engine
  *
- * Fixes in this version:
- * - MEETING intent no longer normalizes "last meeting" to a node ID.
- *   It always runs a date-based Cypher query.
- * - detectIntent no longer passes entityName for MEETING intent
- *   (there is no "last meeting" node — it's a temporal query).
- * - GENERAL fallback improved.
+ * Architecture change: Static edges replaced with Snapshot nodes.
+ * Pattern: (Entity) -[:HAS_STATE]-> (Snapshot) -[:RECORDED_IN]-> (Meeting)
+ *
+ * Each time a Project, ActionItem, or Topic appears in a meeting, a new
+ * Snapshot is created capturing state at that point in time. This gives the
+ * AI the ability to reason about *how* things evolved across meetings.
+ *
+ * Unchanged from Phase 3:
+ * - MEETING intent temporal query (date-based, never node-ID lookup)
+ * - resolveCoReferences
+ * - Intent router / detectIntent
  */
 
 import { Neo4jGraph } from "@langchain/community/graphs/neo4j_graph"
@@ -99,7 +104,7 @@ async function getGraph (): Promise<Neo4jGraph>
 }
 
 // ---------------------------------------------------------------------------
-// Co-reference resolution
+// Co-reference resolution (unchanged)
 // ---------------------------------------------------------------------------
 
 async function resolveCoReferences (
@@ -187,7 +192,16 @@ Only include groups where 2+ names clearly refer to the same person. If all name
 }
 
 // ---------------------------------------------------------------------------
-// addToKnowledgeGraph
+// Helper: build a unique Snapshot ID
+// ---------------------------------------------------------------------------
+
+function snapshotId ( entityId: string, meetingId: string ): string
+{
+  return `snap_${ entityId }_${ meetingId }`
+}
+
+// ---------------------------------------------------------------------------
+// addToKnowledgeGraph — Phase 2: Snapshot architecture
 // ---------------------------------------------------------------------------
 
 export async function addToKnowledgeGraph (
@@ -205,8 +219,11 @@ export async function addToKnowledgeGraph (
       return null
     }
 
-    console.log( "🕸️ Starting Knowledge Graph Extraction (Phase 3)..." )
+    console.log( "🕸️ Starting Knowledge Graph Extraction (Phase 2 — Temporal)..." )
 
+    // ------------------------------------------------------------------
+    // 1. Normalise transcript to plain text
+    // ------------------------------------------------------------------
     let textContent = ""
     if ( Array.isArray( transcript ) )
     {
@@ -231,6 +248,9 @@ export async function addToKnowledgeGraph (
 
     if ( !textContent.trim() ) throw new Error( "EMPTY_TRANSCRIPT_CONTENT" )
 
+    // ------------------------------------------------------------------
+    // 2. Extract & de-duplicate entities
+    // ------------------------------------------------------------------
     const enrichmentResult = await enrichTranscript( textContent )
     let entities = enrichmentResult.entities
     console.log( `✅ Extracted ${ entities.length } raw entities` )
@@ -238,9 +258,15 @@ export async function addToKnowledgeGraph (
     entities = await resolveCoReferences( entities )
     console.log( `✅ After co-reference resolution: ${ entities.length } entities` )
 
+    // ------------------------------------------------------------------
+    // 3. Build node / relationship lists (for the return value / logging)
+    // ------------------------------------------------------------------
     const nodes: GraphNode[] = []
     const relationships: GraphRelationship[] = []
 
+    const meetingTimestamp = meetingStartTime?.toISOString() ?? new Date().toISOString()
+
+    // Meeting node — always a MERGE so re-processing is idempotent
     nodes.push( {
       type: "Meeting",
       id: meetingId,
@@ -248,12 +274,30 @@ export async function addToKnowledgeGraph (
         id: meetingId,
         title: meetingTitle,
         meetingId,
-        startTime: meetingStartTime?.toISOString() ?? new Date().toISOString(),
+        startTime: meetingTimestamp,
       },
     } )
 
+    const neo4j = await getGraph()
+
+    // ------------------------------------------------------------------
+    // 4. Upsert Meeting node
+    // ------------------------------------------------------------------
+    await neo4j.query(
+      `MERGE (m:Meeting {id: $id})
+       SET m += $properties`,
+      { id: meetingId, properties: { id: meetingId, title: meetingTitle, meetingId, startTime: meetingTimestamp } }
+    )
+
+    // ------------------------------------------------------------------
+    // 5. Process each entity
+    // ------------------------------------------------------------------
     for ( const entity of entities )
     {
+      // ----------------------------------------------------------------
+      // PERSON — static node + SPOKE_IN (no Snapshot needed; presence
+      //           in a meeting is a fact, not an evolving state)
+      // ----------------------------------------------------------------
       if ( entity.type === "PERSON" )
       {
         nodes.push( {
@@ -267,49 +311,214 @@ export async function addToKnowledgeGraph (
           type: "SPOKE_IN",
           properties: { meetingId },
         } )
+
+        await neo4j.query(
+          `MERGE (s:Speaker {id: $id})
+           SET s += $properties
+           WITH s
+           MATCH (m:Meeting {id: $meetingId})
+           MERGE (s)-[:SPOKE_IN {meetingId: $meetingId}]->(m)`,
+          {
+            id: entity.normalizedValue,
+            properties: { id: entity.normalizedValue, name: entity.value },
+            meetingId,
+          }
+        )
       }
 
+      // ----------------------------------------------------------------
+      // PROJECT — canonical node + Snapshot per meeting
+      // ----------------------------------------------------------------
+      if ( entity.type === "PROJECT" )
+      {
+        const projectId = entity.normalizedValue
+        const snapId = snapshotId( projectId, meetingId )
+
+        nodes.push( {
+          type: "Project",
+          id: projectId,
+          properties: { id: projectId, name: entity.value },
+        } )
+        nodes.push( {
+          type: "Snapshot",
+          id: snapId,
+          properties: {
+            id: snapId,
+            timestamp: meetingTimestamp,
+            meetingId,
+            entityType: "PROJECT",
+            confidence: entity.confidence,
+            status: ( entity.metadata as Record<string, unknown> ).status ?? null,
+            sentiment: ( entity.metadata as Record<string, unknown> ).sentiment ?? null,
+            risk: ( entity.metadata as Record<string, unknown> ).risk ?? null,
+          },
+        } )
+        relationships.push( { source: projectId, target: snapId, type: "HAS_STATE" } )
+        relationships.push( { source: snapId, target: meetingId, type: "RECORDED_IN", properties: { meetingId } } )
+
+        await neo4j.query(
+          `MERGE (p:Project {id: $projectId})
+           SET p.name = $name
+           WITH p
+           MATCH (m:Meeting {id: $meetingId})
+           CREATE (snap:Snapshot {
+             id: $snapId,
+             timestamp: datetime($timestamp),
+             meetingId: $meetingId,
+             entityType: 'PROJECT',
+             confidence: $confidence,
+             status: $status,
+             sentiment: $sentiment,
+             risk: $risk
+           })
+           MERGE (p)-[:HAS_STATE]->(snap)
+           MERGE (snap)-[:RECORDED_IN]->(m)`,
+          {
+            projectId,
+            name: entity.value,
+            meetingId,
+            snapId,
+            timestamp: meetingTimestamp,
+            confidence: entity.confidence,
+            status: ( entity.metadata as Record<string, unknown> ).status ?? null,
+            sentiment: ( entity.metadata as Record<string, unknown> ).sentiment ?? null,
+            risk: ( entity.metadata as Record<string, unknown> ).risk ?? null,
+          }
+        )
+      }
+
+      // ----------------------------------------------------------------
+      // TOPIC — canonical node + Snapshot per meeting
+      // ----------------------------------------------------------------
+      if ( entity.type === "TOPIC" )
+      {
+        const topicId = entity.normalizedValue
+        const snapId = snapshotId( topicId, meetingId )
+
+        nodes.push( {
+          type: "Topic",
+          id: topicId,
+          properties: { id: topicId, name: entity.value },
+        } )
+        nodes.push( {
+          type: "Snapshot",
+          id: snapId,
+          properties: {
+            id: snapId,
+            timestamp: meetingTimestamp,
+            meetingId,
+            entityType: "TOPIC",
+            confidence: entity.confidence,
+            sentiment: ( entity.metadata as Record<string, unknown> ).sentiment ?? null,
+          },
+        } )
+        relationships.push( { source: topicId, target: snapId, type: "HAS_STATE" } )
+        relationships.push( { source: snapId, target: meetingId, type: "RECORDED_IN", properties: { meetingId } } )
+
+        await neo4j.query(
+          `MERGE (t:Topic {id: $topicId})
+           SET t.name = $name
+           WITH t
+           MATCH (m:Meeting {id: $meetingId})
+           CREATE (snap:Snapshot {
+             id: $snapId,
+             timestamp: datetime($timestamp),
+             meetingId: $meetingId,
+             entityType: 'TOPIC',
+             confidence: $confidence,
+             sentiment: $sentiment
+           })
+           MERGE (t)-[:HAS_STATE]->(snap)
+           MERGE (snap)-[:RECORDED_IN]->(m)`,
+          {
+            topicId,
+            name: entity.value,
+            meetingId,
+            snapId,
+            timestamp: meetingTimestamp,
+            confidence: entity.confidence,
+            sentiment: ( entity.metadata as Record<string, unknown> ).sentiment ?? null,
+          }
+        )
+      }
+
+      // ----------------------------------------------------------------
+      // ACTION_ITEM — canonical node + Snapshot (captures deadline /
+      //               assignedTo at this point in time)
+      // ----------------------------------------------------------------
       if ( entity.type === "ACTION_ITEM" )
       {
         const actionId = `${ meetingId }_${ entity.normalizedValue }`
+        const snapId = snapshotId( actionId, meetingId )
         const meta = entity.metadata as Record<string, unknown>
+        const assignedTo = meta.assignedTo ? String( meta.assignedTo ) : null
+        const deadline = meta.deadline ? String( meta.deadline ) : null
+
         nodes.push( {
           type: "ActionItem",
           id: actionId,
           properties: { id: actionId, text: entity.value, meetingId },
         } )
-        relationships.push( {
-          source: actionId,
-          target: meetingId,
-          type: "MENTIONED_IN",
-          properties: { meetingId },
+        nodes.push( {
+          type: "Snapshot",
+          id: snapId,
+          properties: {
+            id: snapId,
+            timestamp: meetingTimestamp,
+            meetingId,
+            entityType: "ACTION_ITEM",
+            confidence: entity.confidence,
+            assignedTo,
+            deadline,
+            status: ( meta.status as string ) ?? "open",
+          },
         } )
-        if ( meta.assignedTo )
-        {
-          relationships.push( {
-            source: actionId,
-            target: String( meta.assignedTo ),
-            type: "ASSIGNED_TO",
-            properties: { meetingId },
-          } )
-        }
-        if ( meta.deadline )
-        {
-          const deadlineId = `deadline_${ String( meta.deadline ).replace( /[^a-z0-9]/gi, "_" ) }`
-          nodes.push( {
-            type: "Deadline",
-            id: deadlineId,
-            properties: { id: deadlineId, date: meta.deadline },
-          } )
-          relationships.push( {
-            source: actionId,
-            target: deadlineId,
-            type: "HAS_DEADLINE",
-            properties: { meetingId },
-          } )
-        }
+        relationships.push( { source: actionId, target: snapId, type: "HAS_STATE" } )
+        relationships.push( { source: snapId, target: meetingId, type: "RECORDED_IN", properties: { meetingId } } )
+
+        await neo4j.query(
+          `MERGE (a:ActionItem {id: $actionId})
+           SET a.text = $text, a.meetingId = $meetingId
+           WITH a
+           MATCH (m:Meeting {id: $meetingId})
+           CREATE (snap:Snapshot {
+             id: $snapId,
+             timestamp: datetime($timestamp),
+             meetingId: $meetingId,
+             entityType: 'ACTION_ITEM',
+             confidence: $confidence,
+             assignedTo: $assignedTo,
+             deadline: $deadline,
+             status: $status
+           })
+           MERGE (a)-[:HAS_STATE]->(snap)
+           MERGE (snap)-[:RECORDED_IN]->(m)
+           WITH a, snap
+           // Also link ActionItem to its assignee Speaker node if it exists
+           CALL {
+             WITH a, snap
+             MATCH (s:Speaker {id: $assignedTo})
+             MERGE (a)-[:ASSIGNED_TO {meetingId: $meetingId}]->(s)
+             RETURN count(*) AS _
+           }
+           RETURN a`,
+          {
+            actionId,
+            text: entity.value,
+            meetingId,
+            snapId,
+            timestamp: meetingTimestamp,
+            confidence: entity.confidence,
+            assignedTo,
+            deadline,
+            status: ( meta.status as string ) ?? "open",
+          }
+        )
       }
 
+      // ----------------------------------------------------------------
+      // DECISION — unchanged (decisions are facts, not evolving state)
+      // ----------------------------------------------------------------
       if ( entity.type === "DECISION" )
       {
         const decisionId = `${ meetingId }_${ entity.normalizedValue }`
@@ -324,78 +533,34 @@ export async function addToKnowledgeGraph (
           type: "DECIDED_TO",
           properties: { meetingId },
         } )
-      }
 
-      if ( entity.type === "PROJECT" )
-      {
-        nodes.push( {
-          type: "Project",
-          id: entity.normalizedValue,
-          properties: { id: entity.normalizedValue, name: entity.value },
-        } )
-        relationships.push( {
-          source: entity.normalizedValue,
-          target: meetingId,
-          type: "MENTIONED_IN",
-          properties: { meetingId },
-        } )
-      }
-
-      if ( entity.type === "TOPIC" )
-      {
-        nodes.push( {
-          type: "Topic",
-          id: entity.normalizedValue,
-          properties: { id: entity.normalizedValue, name: entity.value },
-        } )
-        relationships.push( {
-          source: meetingId,
-          target: entity.normalizedValue,
-          type: "DISCUSSED",
-          properties: { meetingId },
-        } )
+        await neo4j.query(
+          `MERGE (dec:Decision {id: $id})
+           SET dec.text = $text, dec.meetingId = $meetingId
+           WITH dec
+           MATCH (m:Meeting {id: $meetingId})
+           MERGE (m)-[:DECIDED_TO {meetingId: $meetingId}]->(dec)`,
+          { id: decisionId, text: entity.value, meetingId }
+        )
       }
     }
 
-    const neo4j = await getGraph()
-
-    for ( const node of nodes )
-    {
-      await neo4j.query(
-        `MERGE (n:${ node.type } {id: $id}) SET n += $properties`,
-        { id: node.id, properties: { ...node.properties, id: node.id } }
-      )
-    }
-
-    for ( const rel of relationships )
-    {
-      await neo4j.query(
-        `MATCH (a {id: $sourceId})
-         MATCH (b {id: $targetId})
-         MERGE (a)-[r:${ rel.type } {meetingId: $meetingId}]->(b)
-         SET r += $properties`,
-        {
-          sourceId: rel.source,
-          targetId: rel.target,
-          meetingId: ( rel.properties as Record<string, unknown> )?.meetingId ?? meetingId,
-          properties: rel.properties ?? {},
-        }
-      )
-    }
-
+    // ------------------------------------------------------------------
+    // 6. Link consecutive meetings via shared entities (cross-meeting continuity)
+    // ------------------------------------------------------------------
     await neo4j.query(
       `MATCH (curr:Meeting {id: $meetingId})
        MATCH (prev:Meeting)
        WHERE prev.id <> $meetingId
          AND prev.startTime < curr.startTime
-       MATCH (curr)<-[:MENTIONED_IN]-(shared)
-       MATCH (shared)-[:MENTIONED_IN]->(prev)
+       MATCH (curr)<-[:RECORDED_IN]-(snap1:Snapshot)<-[:HAS_STATE]-(shared)
+       MATCH (shared)-[:HAS_STATE]->(snap2:Snapshot)-[:RECORDED_IN]->(prev)
        WITH curr, prev ORDER BY prev.startTime DESC LIMIT 1
        MERGE (curr)-[:CONTINUED_FROM]->(prev)`,
       { meetingId }
     )
 
-    console.log( `🕸️ Phase 3 Graph Complete: ${ nodes.length } nodes, ${ relationships.length } relationships` )
+    console.log( `🕸️ Phase 2 Graph Complete: ${ nodes.length } nodes, ${ relationships.length } relationships` )
     return { nodes, relationships, meetingId, extractedAt: new Date() }
 
   } catch ( error )
@@ -406,7 +571,7 @@ export async function addToKnowledgeGraph (
 }
 
 // ---------------------------------------------------------------------------
-// Intent detection
+// Intent detection (unchanged)
 // ---------------------------------------------------------------------------
 
 async function detectIntent ( question: string ): Promise<IntentResult>
@@ -445,8 +610,6 @@ Rules:
 
     const parsed = JSON.parse( content.replace( /^```json\s*/i, "" ).replace( /```\s*$/i, "" ).trim() )
 
-    // For MEETING intent, never try to use entityName as a node ID —
-    // "last meeting", "yesterday's call" etc. are temporal queries, not node lookups
     const intent = ( parsed.intent as QueryIntent ) ?? "GENERAL"
     const entityName = intent === "MEETING" ? null : ( parsed.entityName ?? null )
 
@@ -462,35 +625,43 @@ Rules:
 }
 
 // ---------------------------------------------------------------------------
-// Cypher query runners
+// Cypher query runners — Phase 2: traverse HAS_STATE → Snapshot
 // ---------------------------------------------------------------------------
 
 async function runPersonQuery ( neo4j: Neo4jGraph, entityId: string ): Promise<string>
 {
+  // PERSON nodes are still linked directly (SPOKE_IN); no Snapshot needed here.
   const result = await neo4j.query(
     `MATCH (s:Speaker {id: $personId})
      OPTIONAL MATCH (s)-[:SPOKE_IN]->(m:Meeting)
+     // Action items assigned to this person via the Snapshot
      OPTIONAL MATCH (a:ActionItem)-[:ASSIGNED_TO]->(s)
-     OPTIONAL MATCH (a)-[:HAS_DEADLINE]->(d:Deadline)
+     OPTIONAL MATCH (a)-[:HAS_STATE]->(snap:Snapshot)
      RETURN
        s.name AS person,
        collect(DISTINCT m.title) AS meetings,
-       collect(DISTINCT { action: a.text, deadline: d.date }) AS actions`,
+       collect(DISTINCT {
+         action: a.text,
+         deadline: snap.deadline,
+         status: snap.status,
+         assignedAt: toString(snap.timestamp)
+       }) AS actions`,
     { personId: entityId }
   ) as Array<Record<string, unknown>>
 
   if ( !result.length || !result[ 0 ].person )
   {
-    // Try fuzzy match — entityId might be a partial name
+    // Fuzzy fallback
     const fuzzy = await neo4j.query(
       `MATCH (s:Speaker)
        WHERE toLower(s.id) CONTAINS toLower($partial)
           OR toLower(s.name) CONTAINS toLower($partial)
        OPTIONAL MATCH (s)-[:SPOKE_IN]->(m:Meeting)
        OPTIONAL MATCH (a:ActionItem)-[:ASSIGNED_TO]->(s)
+       OPTIONAL MATCH (a)-[:HAS_STATE]->(snap:Snapshot)
        RETURN s.name AS person,
               collect(DISTINCT m.title) AS meetings,
-              collect(DISTINCT a.text) AS actions
+              collect(DISTINCT { action: a.text, deadline: snap.deadline, status: snap.status }) AS actions
        LIMIT 3`,
       { partial: entityId }
     ) as Array<Record<string, unknown>>
@@ -503,37 +674,58 @@ async function runPersonQuery ( neo4j: Neo4jGraph, entityId: string ): Promise<s
     return fuzzy.map( row =>
     {
       const meetings = ( row.meetings as string[] ).filter( Boolean )
-      const actions = ( row.actions as string[] ).filter( Boolean )
+      const actions = ( row.actions as Array<{ action: string; deadline: string; status: string }> ).filter( a => a.action )
       let out = `**${ row.person }** appeared in ${ meetings.length } meeting(s): ${ meetings.join( ", " ) || "none" }.`
-      if ( actions.length ) out += `\n\nAction items: ${ actions.map( a => `- ${ a }` ).join( "\n" ) }`
+      if ( actions.length )
+      {
+        out += `\n\nAction items:\n`
+        out += actions.map( a =>
+          `- ${ a.action }${ a.deadline ? ` (due: ${ a.deadline })` : "" }${ a.status ? ` [status: ${ a.status }]` : "" }`
+        ).join( "\n" )
+      }
       return out
     } ).join( "\n\n" )
   }
 
   const row = result[ 0 ]
   const meetings = ( row.meetings as string[] ).filter( Boolean )
-  const actions = ( row.actions as Array<{ action: string; deadline: string }> ).filter( ( a ) => a.action )
+  const actions = ( row.actions as Array<{ action: string; deadline: string; status: string; assignedAt: string }> ).filter( a => a.action )
 
   let out = `**${ row.person }** appeared in ${ meetings.length } meeting(s): ${ meetings.join( ", " ) || "none" }.`
   if ( actions.length )
   {
     out += `\n\nAction items:\n`
-    out += actions.map( ( a ) => `- ${ a.action }${ a.deadline ? ` (due: ${ a.deadline })` : "" }` ).join( "\n" )
+    out += actions.map( a =>
+      `- ${ a.action }${ a.deadline ? ` (due: ${ a.deadline })` : "" }${ a.status ? ` [status: ${ a.status }]` : "" }`
+    ).join( "\n" )
   }
   return out
 }
 
 async function runProjectQuery ( neo4j: Neo4jGraph, entityId: string ): Promise<string>
 {
+  // Traverse HAS_STATE → Snapshot → RECORDED_IN → Meeting; order by timestamp DESC
   const result = await neo4j.query(
     `MATCH (p:Project)
      WHERE p.id = $projectId OR toLower(p.name) CONTAINS toLower($projectId)
-     OPTIONAL MATCH (p)-[:MENTIONED_IN]->(m:Meeting)
+     OPTIONAL MATCH (p)-[:HAS_STATE]->(snap:Snapshot)-[:RECORDED_IN]->(m:Meeting)
      OPTIONAL MATCH (m)-[:DECIDED_TO]->(dec:Decision)
+     WITH p,
+          snap,
+          m,
+          collect(DISTINCT dec.text) AS decisions
+     ORDER BY snap.timestamp DESC
+     LIMIT 5
      RETURN p.name AS project,
-            collect(DISTINCT { title: m.title, time: m.startTime }) AS meetings,
-            collect(DISTINCT dec.text) AS decisions
-     LIMIT 1`,
+            collect({
+              date: toString(snap.timestamp),
+              meetingTitle: m.title,
+              status: snap.status,
+              risk: snap.risk,
+              sentiment: snap.sentiment,
+              confidence: snap.confidence,
+              decisions: decisions
+            }) AS timeline`,
     { projectId: entityId }
   ) as Array<Record<string, unknown>>
 
@@ -543,16 +735,30 @@ async function runProjectQuery ( neo4j: Neo4jGraph, entityId: string ): Promise<
   }
 
   const row = result[ 0 ]
-  const meetings = ( row.meetings as Array<{ title: string; time: string }> ).filter( ( m ) => m.title )
-  const decisions = ( row.decisions as string[] ).filter( Boolean )
+  const timeline = ( row.timeline as Array<{
+    date: string
+    meetingTitle: string
+    status: string | null
+    risk: string | null
+    sentiment: string | null
+    confidence: number
+    decisions: string[]
+  }> ).filter( t => t.meetingTitle )
 
-  let out = `**${ row.project }** was discussed in ${ meetings.length } meeting(s):\n`
-  out += meetings.map( ( m ) => `- ${ m.title }${ m.time ? ` (${ m.time.substring( 0, 10 ) })` : "" }` ).join( "\n" )
-  if ( decisions.length )
+  let out = `**${ row.project }** — Evolution Timeline (${ timeline.length } snapshot(s)):\n`
+  out += timeline.map( t =>
   {
-    out += `\n\nDecisions made:\n`
-    out += decisions.map( ( d ) => `- ${ d }` ).join( "\n" )
-  }
+    const date = t.date ? t.date.substring( 0, 10 ) : "unknown date"
+    let line = `- [${ date }] *${ t.meetingTitle }*`
+    const meta: string[] = []
+    if ( t.status ) meta.push( `status: ${ t.status }` )
+    if ( t.risk ) meta.push( `risk: ${ t.risk }` )
+    if ( t.sentiment ) meta.push( `sentiment: ${ t.sentiment }` )
+    if ( meta.length ) line += ` — ${ meta.join( ", " ) }`
+    if ( t.decisions?.length ) line += `\n  Decisions: ${ t.decisions.join( "; " ) }`
+    return line
+  } ).join( "\n" )
+
   return out
 }
 
@@ -561,10 +767,17 @@ async function runTopicQuery ( neo4j: Neo4jGraph, entityId: string ): Promise<st
   const result = await neo4j.query(
     `MATCH (t:Topic)
      WHERE t.id = $topicId OR toLower(t.name) CONTAINS toLower($topicId)
-     OPTIONAL MATCH (t)<-[:DISCUSSED]-(m:Meeting)
+     OPTIONAL MATCH (t)-[:HAS_STATE]->(snap:Snapshot)-[:RECORDED_IN]->(m:Meeting)
+     WITH t, snap, m
+     ORDER BY snap.timestamp DESC
+     LIMIT 5
      RETURN t.name AS topic,
-            collect({ title: m.title, time: m.startTime }) AS meetings
-     LIMIT 1`,
+            collect({
+              date: toString(snap.timestamp),
+              meetingTitle: m.title,
+              sentiment: snap.sentiment,
+              confidence: snap.confidence
+            }) AS timeline`,
     { topicId: entityId }
   ) as Array<Record<string, unknown>>
 
@@ -574,25 +787,42 @@ async function runTopicQuery ( neo4j: Neo4jGraph, entityId: string ): Promise<st
   }
 
   const row = result[ 0 ]
-  const meetings = ( row.meetings as Array<{ title: string; time: string }> ).filter( ( m ) => m.title )
+  const timeline = ( row.timeline as Array<{
+    date: string
+    meetingTitle: string
+    sentiment: string | null
+    confidence: number
+  }> ).filter( t => t.meetingTitle )
 
-  let out = `**${ row.topic }** was discussed in ${ meetings.length } meeting(s):\n`
-  out += meetings.map( ( m ) => `- ${ m.title }${ m.time ? ` (${ m.time.substring( 0, 10 ) })` : "" }` ).join( "\n" )
+  let out = `**${ row.topic }** — Discussion Timeline (${ timeline.length } occurrence(s)):\n`
+  out += timeline.map( t =>
+  {
+    const date = t.date ? t.date.substring( 0, 10 ) : "unknown date"
+    let line = `- [${ date }] *${ t.meetingTitle }*`
+    if ( t.sentiment ) line += ` — sentiment: ${ t.sentiment }`
+    return line
+  } ).join( "\n" )
+
   return out
 }
 
 async function runActionItemQuery ( neo4j: Neo4jGraph ): Promise<string>
 {
+  // Pull the most recent Snapshot per ActionItem to get current state
   const result = await neo4j.query(
-    `MATCH (a:ActionItem)
+    `MATCH (a:ActionItem)-[:HAS_STATE]->(snap:Snapshot)-[:RECORDED_IN]->(m:Meeting)
+     WITH a, snap, m
+     ORDER BY snap.timestamp DESC
+     // Keep only the latest snapshot per ActionItem
+     WITH a, head(collect(snap)) AS latestSnap, head(collect(m)) AS latestMeeting
      OPTIONAL MATCH (a)-[:ASSIGNED_TO]->(s:Speaker)
-     OPTIONAL MATCH (a)-[:HAS_DEADLINE]->(d:Deadline)
-     OPTIONAL MATCH (a)-[:MENTIONED_IN]->(m:Meeting)
      RETURN a.text AS action,
             s.name AS assignee,
-            d.date AS deadline,
-            collect(DISTINCT m.title) AS meetings
-     ORDER BY d.date ASC
+            latestSnap.deadline AS deadline,
+            latestSnap.status AS status,
+            toString(latestSnap.timestamp) AS lastSeen,
+            latestMeeting.title AS lastMeeting
+     ORDER BY latestSnap.deadline ASC
      LIMIT 20`
   ) as Array<Record<string, unknown>>
 
@@ -604,6 +834,8 @@ async function runActionItemQuery ( neo4j: Neo4jGraph ): Promise<string>
       let line = `- **${ row.action }**`
       if ( row.assignee ) line += ` → ${ row.assignee }`
       if ( row.deadline ) line += ` (due: ${ row.deadline })`
+      if ( row.status ) line += ` [status: ${ row.status }]`
+      if ( row.lastMeeting ) line += `\n  Last seen in: *${ row.lastMeeting }*${ row.lastSeen ? ` (${ String( row.lastSeen ).substring( 0, 10 ) })` : "" }`
       return line
     } )
     .join( "\n" )
@@ -611,8 +843,6 @@ async function runActionItemQuery ( neo4j: Neo4jGraph ): Promise<string>
 
 async function runMeetingQuery ( neo4j: Neo4jGraph, question: string ): Promise<string>
 {
-  // Always use recency-based query — never try to look up "last meeting" as a node ID
-  // Optionally narrow by date range if the question mentions specific dates
   let dateFilter = ""
   try
   {
@@ -634,20 +864,20 @@ wantMostRecent = true when the question says "last", "latest", "most recent", "r
     const parsed = JSON.parse( dateResp.choices[ 0 ]?.message?.content ?? "{}" )
     if ( parsed.from ) dateFilter = `WHERE m.startTime >= datetime('${ parsed.from }T00:00:00')`
     if ( parsed.to ) dateFilter += ` ${ dateFilter ? "AND" : "WHERE" } m.startTime <= datetime('${ parsed.to }T23:59:59')`
-    // wantMostRecent is handled by ORDER BY DESC LIMIT below
-  } catch { /* ignore — run without date filter */ }
+  } catch { /* run without date filter */ }
 
   const result = await neo4j.query(
     `MATCH (m:Meeting)
      ${ dateFilter }
      OPTIONAL MATCH (s:Speaker)-[:SPOKE_IN]->(m)
      OPTIONAL MATCH (m)-[:DECIDED_TO]->(dec:Decision)
-     OPTIONAL MATCH (a:ActionItem)-[:MENTIONED_IN]->(m)
+     // Count action item snapshots recorded in this meeting
+     OPTIONAL MATCH (snap:Snapshot {entityType: 'ACTION_ITEM'})-[:RECORDED_IN]->(m)
      RETURN m.title AS title,
             m.startTime AS startTime,
             collect(DISTINCT s.name) AS speakers,
             collect(DISTINCT dec.text) AS decisions,
-            count(DISTINCT a) AS actionCount
+            count(DISTINCT snap) AS actionCount
      ORDER BY m.startTime DESC
      LIMIT 5`
   ) as Array<Record<string, unknown>>
@@ -663,7 +893,7 @@ wantMostRecent = true when the question says "last", "latest", "most recent", "r
       let out = `**${ row.title }** (${ date })`
       if ( speakers.length ) out += `\nParticipants: ${ speakers.join( ", " ) }`
       if ( decisions.length ) out += `\nDecisions: ${ decisions.join( "; " ) }`
-      if ( row.actionCount ) out += `\nAction items: ${ row.actionCount }`
+      if ( row.actionCount ) out += `\nAction items tracked: ${ row.actionCount }`
       return out
     } )
     .join( "\n\n" )
@@ -674,10 +904,10 @@ async function runGeneralQuery ( neo4j: Neo4jGraph, question: string ): Promise<
   const stats = await neo4j.query(
     `MATCH (m:Meeting)
      OPTIONAL MATCH (s:Speaker)-[:SPOKE_IN]->(m)
-     OPTIONAL MATCH (a:ActionItem)-[:MENTIONED_IN]->(m)
+     OPTIONAL MATCH (snap:Snapshot {entityType: 'ACTION_ITEM'})-[:RECORDED_IN]->(m)
      RETURN m.title AS title, m.startTime AS time,
             collect(DISTINCT s.name) AS speakers,
-            count(DISTINCT a) AS actionCount
+            count(DISTINCT snap) AS actionCount
      ORDER BY m.startTime DESC LIMIT 5`
   ) as Array<Record<string, unknown>>
 
@@ -685,7 +915,7 @@ async function runGeneralQuery ( neo4j: Neo4jGraph, question: string ): Promise<
     .map( ( r ) =>
     {
       const speakers = ( r.speakers as string[] ).filter( Boolean ).join( ", " )
-      return `Meeting: "${ r.title }" | participants: ${ speakers || "unknown" } | actions: ${ r.actionCount }`
+      return `Meeting: "${ r.title }" | participants: ${ speakers || "unknown" } | action snapshots: ${ r.actionCount }`
     } )
     .join( "\n" )
 
@@ -716,7 +946,7 @@ async function runGeneralQuery ( neo4j: Neo4jGraph, question: string ): Promise<
 }
 
 // ---------------------------------------------------------------------------
-// queryGraphMemory — intent router
+// queryGraphMemory — intent router (unchanged)
 // ---------------------------------------------------------------------------
 
 export async function queryGraphMemory ( question: string ): Promise<string>
@@ -749,7 +979,6 @@ export async function queryGraphMemory ( question: string ): Promise<string>
         return await runActionItemQuery( neo4j )
 
       case "MEETING":
-        // Always runs date-based query — never uses entityName as node ID
         return await runMeetingQuery( neo4j, question )
 
       case "GENERAL":
@@ -787,18 +1016,35 @@ export async function deleteGraphForMeeting ( meetingId: string ): Promise<boole
   try
   {
     const neo4jGraph = await getGraph()
+
+    // Delete Snapshot nodes recorded in this meeting (they are meeting-scoped by design)
     await neo4jGraph.query(
-      `MATCH (n)
-       WHERE n.meetingId = $meetingId
-         AND NOT n:Speaker AND NOT n:Project AND NOT n:Topic
-       DETACH DELETE n`,
+      `MATCH (snap:Snapshot)-[:RECORDED_IN]->(m:Meeting {id: $meetingId})
+       DETACH DELETE snap`,
       { meetingId }
     )
+
+    // Delete Decisions created in this meeting
+    await neo4jGraph.query(
+      `MATCH (dec:Decision {meetingId: $meetingId})
+       DETACH DELETE dec`,
+      { meetingId }
+    )
+
+    // Delete relationships scoped to this meeting (SPOKE_IN, ASSIGNED_TO, DECIDED_TO)
     await neo4jGraph.query(
       `MATCH ()-[r {meetingId: $meetingId}]->()
        DELETE r`,
       { meetingId }
     )
+
+    // Delete orphaned ActionItem nodes (no remaining HAS_STATE edges)
+    await neo4jGraph.query(
+      `MATCH (a:ActionItem)
+       WHERE NOT (a)-[:HAS_STATE]->()
+       DETACH DELETE a`
+    )
+
     console.log( `🧹 Deleted meeting-scoped data for ${ meetingId }` )
     return true
   } catch ( error )
@@ -819,11 +1065,18 @@ export async function getGraphStatistics (): Promise<Record<string, unknown>>
     const relStats = await neo4j.query(
       `MATCH ()-[r]->() RETURN type(r) as type, count(*) as count ORDER BY count DESC`
     )
+    const snapshotStats = await neo4j.query(
+      `MATCH (snap:Snapshot)
+       RETURN snap.entityType AS entityType, count(*) AS count
+       ORDER BY count DESC`
+    )
     const nodeResult = nodeStats as Array<Record<string, unknown>>
     const relResult = relStats as Array<Record<string, unknown>>
+    const snapResult = snapshotStats as Array<Record<string, unknown>>
     return {
       nodesByType: Object.fromEntries( nodeResult.map( ( s ) => [ s.type, s.count ] ) ),
       relationshipsByType: Object.fromEntries( relResult.map( ( s ) => [ s.type, s.count ] ) ),
+      snapshotsByEntityType: Object.fromEntries( snapResult.map( ( s ) => [ s.entityType, s.count ] ) ),
       totalNodes: nodeResult.reduce( ( sum, s ) => sum + Number( s.count ?? 0 ), 0 ),
       totalRelationships: relResult.reduce( ( sum, s ) => sum + Number( s.count ?? 0 ), 0 ),
     }
