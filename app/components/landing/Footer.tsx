@@ -1,25 +1,26 @@
-import { Bot } from 'lucide-react'
-import React from 'react'
+import { Bot } from "lucide-react";
+import Link from "next/link";
 
-function Footer ()
-{
-    return (
-        <footer className='border-t border-gray-800 py-5 bg-black'>
-            <div className='max-w-6xl mx-auto px-4'>
-                <div className='flex flex-col md:flex-row justify-between items-center'>
-                    <div className='flex items-center space-x-2 mb-4 md:mb-0'>
-                        <div className='w-8 h-8 bg-gray-800 rounded-lg flex items-center justify-center'>
-                            <Bot className='w-5 h-5 text-gray-300' />
-                        </div>
-                        <span className='text-xl font-bold text-white'>Meetings AI</span>
-                    </div>
-                    <div className='text-gray-500 text-sm'>
-                        &copy; { new Date().getFullYear() } Meetings AI. Made with ❤️ for better meetings.
-                    </div>
-                </div>
-            </div>
-        </footer>
-    )
+export default function Footer() {
+  return (
+    <footer className="border-t border-white/5 py-16 mt-20">
+      <div className="mx-auto max-w-6xl px-4 flex flex-col items-center">
+        <Link href="/" className="flex items-center gap-2 font-semibold">
+          <span className="grid h-8 w-8 place-items-center rounded-lg bg-gradient-to-br from-cyan-400 to-indigo-500 text-background">
+            <Bot className="h-4 w-4" />
+          </span>
+          Meetings AI
+        </Link>
+        <p className="mt-4 text-sm text-muted-foreground">Transform Your Meetings with AI Magic.</p>
+        <div className="mt-8 flex gap-6 text-sm text-muted-foreground">
+          <Link href="#" className="hover:text-foreground">Privacy Policy</Link>
+          <Link href="#" className="hover:text-foreground">Terms of Service</Link>
+          <Link href="#" className="hover:text-foreground">Support</Link>
+        </div>
+        <div className="mt-12 text-xs text-muted-foreground">
+          © {new Date().getFullYear()} Meetings AI. All rights reserved.
+        </div>
+      </div>
+    </footer>
+  );
 }
-
-export default Footer

@@ -1,4 +1,4 @@
-import Image from "next/image";
+import { Navbar } from "./components/landing/Navbar";
 import HeroSection from "./components/landing/HeroSection";
 import FeaturesSection from "./components/landing/FeaturesSection";
 import IntegrationsSection from "./components/landing/IntegrationsSection";
@@ -11,8 +11,8 @@ import Footer from "./components/landing/Footer";
 export default function Home ()
 {
   return (
-
-    <div className="min-h-screen bg-black">
+    <div className="min-h-screen bg-background dark selection:bg-cyan-500/30">
+      <Navbar />
       <HeroSection />
       <FeaturesSection />
       <IntegrationsSection />

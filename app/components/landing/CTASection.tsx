@@ -1,54 +1,51 @@
 'use client'
 
-import { Button } from '@/components/ui/button'
-import { SignUpButton, useUser } from '@clerk/nextjs'
-import { ArrowRight, Star } from 'lucide-react'
-import Link from 'next/link'
-import React from 'react'
+import { ArrowRight, Star } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import Link from "next/link";
+import { useUser, SignUpButton } from "@clerk/nextjs";
 
-function CTASection ()
-{
-    const { isSignedIn } = useUser()
-    return (
-        <section className='py-20 bg-black'>
-            <div className='max-w-4xl mx-auto px-4 text-center'>
-                <h2 className='text-3xl md:text-4xl font-bold text-white mb-4'>
-                    Ready to{ ' ' }
-                    <span className="bg-gradient-to-r from-blue-400 via-blue-500 to-blue-600  bg-clip-text text-transparent">
-                        revolutionize your meetings?
-                    </span>
-                </h2>
-                <p className="text-lg bg-gradient-to-r from-gray-300 to-gray-500 bg-clip-text text-transparent drop-shadow-[0_0_15px_rgba(156,163,175,0.3)] mb-8">
-                    Join thousands of teams aldready using MeetingBot to save time.
-                </p>
-                { isSignedIn ? (
-                    <Button asChild size="lg" className='bg-blue-600 hover:bg-blue-700 px-8 py-4'>
-                        <Link href="/home" className='group'>
-                            <span>Dashboard</span>
-                            <ArrowRight className="w-5 h-5 ml-2 group-hover:translate-x-1 transition-transform" />
-                        </Link>
-                    </Button>
-                ) : (
-                    <SignUpButton>
-                        <Button size="lg" className="bg-blue-600 hover:bg-blue-700 px-8 py-4 group">
-                            <span>Start Your Free Trail</span>
-                            <ArrowRight className="w-5 h-5 ml-2 group-hover:translate-x-1 transition-transform" />
-                        </Button>
-                    </SignUpButton>
-                ) }
-                <div className="flex items-center justify-center space-x-1 mt-6">
-                    <Star className="w-5 h-5 text-yellow-400 fill-current" />
-                    <Star className="w-5 h-5 text-yellow-400 fill-current" />
-                    <Star className="w-5 h-5 text-yellow-400 fill-current" />
-                    <Star className="w-5 h-5 text-yellow-400 fill-current" />
-                    <Star className="w-5 h-5 text-yellow-400 fill-current" />
-                    <span className='ml-2 text-gray-500'>
-                        4.9/5 from 2+ reviews
-                    </span>
-                </div>
-            </div>
-        </section>
-    )
+export default function CTASection() {
+  const { isSignedIn } = useUser();
+
+  return (
+    <section className="py-32 relative overflow-hidden">
+      <div className="absolute inset-0 -z-10">
+        <div className="absolute left-1/2 top-1/2 h-[500px] w-[900px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-gradient-to-r from-cyan-400/20 to-indigo-500/25 blur-[120px]" />
+      </div>
+      <div className="mx-auto max-w-4xl px-4 text-center">
+        <div className="mb-6 inline-flex items-center gap-2 rounded-full glass px-4 py-1.5 text-xs font-medium text-amber-200">
+           <div className="flex">
+             {[...Array(5)].map((_, i) => (
+                <Star key={i} className="h-3.5 w-3.5 fill-current" />
+             ))}
+           </div>
+           4.9/5 from 2+ reviews
+        </div>
+        
+        <h2 className="text-4xl md:text-6xl font-bold tracking-tight">
+          Ready to revolutionize <br />
+          <span className="text-gradient">your meetings?</span>
+        </h2>
+        <p className="mt-6 text-muted-foreground max-w-xl mx-auto text-lg">
+          Join thousands of teams already using MeetingBot to save time.
+        </p>
+        <div className="mt-10 flex flex-col sm:flex-row gap-3 justify-center">
+          {isSignedIn ? (
+             <Button asChild size="lg" className="bg-gradient-to-r from-cyan-400 to-indigo-500 text-background hover:opacity-90 glow group cursor-pointer">
+               <Link href="/home">
+                  Dashboard <ArrowRight className="ml-2 h-4 w-4 group-hover:translate-x-1 transition-transform" />
+               </Link>
+             </Button>
+          ) : (
+             <SignUpButton mode="modal">
+               <Button size="lg" className="bg-gradient-to-r from-cyan-400 to-indigo-500 text-background hover:opacity-90 glow group cursor-pointer">
+                 Start Free Trial <ArrowRight className="ml-2 h-4 w-4 group-hover:translate-x-1 transition-transform" />
+               </Button>
+             </SignUpButton>
+          )}
+        </div>
+      </div>
+    </section>
+  );
 }
-
-export default CTASection
